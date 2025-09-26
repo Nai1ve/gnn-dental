@@ -1,25 +1,24 @@
 import logging
 import os
-import time
 
 import torch.optim
 
-from .model import GAT_Numbering_Corrector
-from .focal_loss import FocalLoss
-from .util import calculate_weights
-from torch_geometric.data import Data, DataLoader
+from model import GAT_Numbering_Corrector
+from focal_loss import FocalLoss
+from util import calculate_weights
+from torch_geometric.data import DataLoader
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-data_path = 'gnn_train_data.pt'
-val_data_path = 'gnn_val_data.pt'
+data_path = 'gnn_train_data_0.05.pt'
+val_data_path = 'gnn_val_data_0.05.pt'
 model_save_dir = 'checkpoints'
-os.mkdir(model_save_dir,exist_ok = True)
+os.makedirs(model_save_dir, exist_ok=True)
 
 
 # 超参数
 LEARNING_RATE = 1e-3
-BATCH_SIZE = 32 # 可以根据你的显存调整
-EPOCHS = 500
+BATCH_SIZE = 128 # 可以根据你的显存调整
+EPOCHS = 2000
 HIDDEN_CHANNELS = 128
 HEADS = 4
 INPUT_CHANNELS = 55

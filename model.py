@@ -24,10 +24,11 @@ class GAT_Numbering_Corrector(torch.nn.Module):
         self.conv1 = GATv2Conv(in_channels,hidden_channels,heads=heads)
 
         #2. 128 * heads ->128 * heads
-        self.conv2 = GATv2Conv(hidden_channels* heads,out_channels)
+        self.conv2 = GATv2Conv(hidden_channels* heads,hidden_channels,heads=heads)
 
         #3. 128 * heads -> 49
-        self.classifier = Linear(hidden_channels * heads,out_channels)
+        self.classifier = Linear(hidden_channels *heads,out_channels)
+
 
 
     def forward(self,data:Data):

@@ -20,7 +20,7 @@ def calculate_weights(train_data_list:List[Data])->Tensor:
         logging.warning("训练数据列表为空，无法计算权重。")
         return torch.ones(NUM_CLASSES) # 返回默认权重
 
-    all_labels = [data.y for data in train_data_list]
+    all_labels = torch.cat([data.y for data in train_data_list])
 
     class_counts = torch.bincount(all_labels, minlength=NUM_CLASSES)
     logging.info(f"类别频率统计 (0-{NUM_CLASSES-1}): {class_counts.tolist()}")
