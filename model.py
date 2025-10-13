@@ -20,7 +20,7 @@ class GAT_Numbering_Corrector(torch.nn.Module):
         """
         super().__init__()
 
-        # 1. 扩展 54-> 128 * heads
+        # 1. 扩展 55-> 128 * heads
         self.conv1 = GATv2Conv(in_channels,hidden_channels,heads=heads)
 
         #2. 128 * heads ->128 * heads

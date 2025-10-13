@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data_path = 'gnn_train_data_0.05.pt'
-val_data_path = 'gnn_val_data_0.05.pt'
+val_data_path = 'gnn_val_data_0.3.pt'
 model_save_dir = 'checkpoints'
 os.makedirs(model_save_dir, exist_ok=True)
 
@@ -17,7 +17,7 @@ os.makedirs(model_save_dir, exist_ok=True)
 # 超参数
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 128 # 可以根据你的显存调整
-EPOCHS = 2000
+EPOCHS = 1000
 HIDDEN_CHANNELS = 128
 HEADS = 4
 INPUT_CHANNELS = 55
