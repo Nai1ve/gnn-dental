@@ -5,12 +5,15 @@ from model import GAT_Numbering_Corrector
 from focal_loss import FocalLoss
 from util import calculate_weights
 from torch_geometric.data import DataLoader
+from datetime import datetime
 import matplotlib.pyplot as plt
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data_path = 'gnn_train_data_0.05.pt'
 val_data_path = 'gnn_val_data_0.3.pt'
-model_save_dir = 'checkpoints'
+
+model_save_dir = f'checkpoints/{datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
 os.makedirs(model_save_dir, exist_ok=True)
 
 
@@ -113,6 +116,14 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(),lr= LEARNING_RATE)
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',  # 当监控的指标停止最大化时，降低学习率
+        factor=0.1,  # 学习率降低的倍数 (new_lr = lr * factor)
+        patience=50,  # 在50个epoch内验证准确率没有提升，就降低学习率
+        verbose=True  # 打印学习率变化信息
+    )
+
     # ADDED: Lists to store history for plotting
     train_loss_history = []
     val_loss_history = []
@@ -125,6 +136,8 @@ def main():
 
         train_loss = train_epoch(model,train_loader,criterion,optimizer)
         val_loss,val_accuracy = validate_epoch(model,val_loader,criterion)
+
+        scheduler.step(val_accuracy)
 
         # ADDED: Append the latest metrics to our history lists
         train_loss_history.append(train_loss)
