@@ -1,21 +1,29 @@
+from collections import defaultdict
+
 import torch
 from torch_geometric.data import DataLoader
+
 from focal_loss import FocalLoss
 from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2
 from util import calculate_weights
 import logging
 import os
+import pickle
 
 # --- 配置 ---
 BEST_MODEL_PATH = 'checkpoints/best_model.pth'
 TEST_DATA_PATH = 'gnn_test_data.pt'
 
+OUTPUT_RESULTS_PATH = 'gnn_corrected_results.pkl'
+
 BATCH_SIZE = 128
 INPUT_CHANNELS = 55
+INPUT_CHANNELS_V3 = 1030
 HIDDEN_CHANNELS = 128
 OUTPUT_CHANNELS = 49
 HEADS = 4
 DROPOUT_RATE = 0.2 # 如果你用了V2模型，确保这个值匹配
+BACKGROUND_CLASS_INDEX = 48
 
 USE_V2_MODEL = False
 
@@ -29,29 +37,63 @@ def test_model(model,loader,criterion):
     correct_nodes = 0
     total_nodes = 0
 
-    all_preds = []
-    all_gts = []
+    results_by_image = defaultdict(dict)
 
     for batch in loader:
         batch = batch.to(device)
         out = model(batch)
+        gnn_preds = out.argmax(dim=1)
+
         loss = criterion(out,batch.y)
         total_loss += loss.item() * batch.num_graphs
 
         pred = out.argmax(dim=1)
+        # 节点分类准确率
         correct_nodes += int((pred == batch.y).sum())
         total_nodes += batch.num_nodes
 
-        all_preds.append(pred.cpu())
-        all_gts.append(batch.cpu())
+        # 解包数据
+        graph_list = batch.to_data_list()
+        node_offset = 0
+        for graph in graph_list:
+            num_nodes_in_graph = graph.num_nodes
 
-    all_preds = torch.cat(all_preds,dim=0)
-    all_gts = torch.cat(all_gts,dim=0)
+            img_id = graph.img_id
+
+            # 从整个预测结果中切出书序当前图的部分
+            node_predictions = gnn_preds[node_offset : node_offset + num_nodes_in_graph]
+
+            image_predictions = []
+
+            for i in range(num_nodes_in_graph):
+                is_background = (node_predictions[i].item() == BACKGROUND_CLASS_INDEX)
+
+                # 我们只保留GNN认为不是背景的预测
+                if not is_background:
+                    prediction_details = {
+                        # 原始Faster R-CNN的信息
+                        'bbox': graph.pred_bboxes_raw[i].cpu().numpy(),
+                        'original_score': graph.pred_scores_raw[i].item(),
+                        'original_label_idx': graph.pred_labels_raw[i].item(),
+                        # GNN修正后的信息
+                        'corrected_label_idx': node_predictions[i].item()
+                    }
+                    image_predictions.append(prediction_details)
+
+            # 将这张图片的所有有效预测存入我们的主字典
+            results_by_image[img_id] = {
+                'img_path': graph.img_path,
+                'ori_shape': graph.ori_shape.cpu().numpy(),
+                'predictions': image_predictions
+            }
+
+            # 更新偏移量，处理下一张图
+            node_offset += num_nodes_in_graph
 
     avg_loss = total_loss / len(loader.dataset)
     test_accuracy = correct_nodes / total_nodes
 
-    return avg_loss,test_accuracy,all_preds,all_gts
+    return results_by_image,avg_loss,test_accuracy
 
 
 def main():
@@ -105,7 +147,7 @@ def main():
 
     # --- 5. 执行测试 ---
     logging.info("开始在测试集上进行最终评估...")
-    test_loss, test_accuracy, all_preds, all_gts = test_model(model, test_loader, criterion)
+    final_results,test_loss, test_accuracy = test_model(model, test_loader, criterion)
 
     logging.info("\n" + "=" * 30)
     logging.info("--- 测试评估结果 ---")
@@ -115,13 +157,11 @@ def main():
 
     # --- 6. 保存预测结果以供详细分析 ---
     # 这个文件可以被你的错误分析脚本读取，来计算最终的FP-Class, FP-Hallu等指标
-    results_for_analysis = {
-        'predictions': all_preds,
-        'ground_truths': all_gts
-    }
-    output_path = 'gnn_test_predictions.pt'
-    torch.save(results_for_analysis, output_path)
-    logging.info(f"GNN的预测结果和真实标签已保存到: {output_path}")
+    # --- 5. 将最终的结构化结果保存到文件 ---
+    logging.info(f"正在将 {len(final_results)} 张图片的修正结果保存到: {OUTPUT_RESULTS_PATH}")
+    with open(OUTPUT_RESULTS_PATH, 'wb') as f:
+        pickle.dump(final_results, f)
+    logging.info("保存完成。")
 
 
 if __name__ == '__main__':
