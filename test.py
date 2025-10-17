@@ -29,6 +29,23 @@ USE_V2_MODEL = False
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def prepare_for_saving(data):
+    """
+    递归地遍历一个数据结构，将所有PyTorch张量移动到CPU并从计算图中分离。
+    """
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu()
+    elif isinstance(data, dict):
+        return {k: prepare_for_saving(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [prepare_for_saving(item) for item in data]
+    elif isinstance(data, tuple):
+        return tuple(prepare_for_saving(item) for item in data)
+    else:
+        # 对于非Tensor、dict、list、tuple的类型，直接返回
+        return data
+
+
 @torch.no_grad()
 def test_model(model,loader,criterion):
     """测试集上评估"""
@@ -155,12 +172,21 @@ def main():
     logging.info(f"测试集节点准确率 (Test Accuracy): {test_accuracy:.4f} (或 {test_accuracy:.2%})")
     logging.info("=" * 30)
 
+    # --- 最佳实践：步骤 2 ---
+    # 在保存之前，调用我们的辅助函数来“净化”结果
+    logging.info("正在将结果中的所有张量转移到 CPU 以确保可移植性...")
+    final_results_cpu = prepare_for_saving(final_results)
+
     # --- 6. 保存预测结果以供详细分析 ---
-    # 这个文件可以被你的错误分析脚本读取，来计算最终的FP-Class, FP-Hallu等指标
-    # --- 5. 将最终的结构化结果保存到文件 ---
-    logging.info(f"正在将 {len(final_results)} 张图片的修正结果保存到: {OUTPUT_RESULTS_PATH}")
-    with open(OUTPUT_RESULTS_PATH, 'wb') as f:
-        pickle.dump(final_results, f)
+    logging.info(f"正在将 {len(final_results_cpu)} 张图片的修正结果保存到: {OUTPUT_RESULTS_PATH}")
+
+    # 推荐使用 torch.save，因为它对PyTorch对象有更好的原生支持
+    torch.save(final_results_cpu, OUTPUT_RESULTS_PATH)
+
+    # 如果你坚持使用 pickle，也是可以的，因为数据已经被处理过了
+    # with open(OUTPUT_RESULTS_PATH, 'wb') as f:
+    #     pickle.dump(final_results_cpu, f)
+
     logging.info("保存完成。")
 
 
