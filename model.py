@@ -1,6 +1,6 @@
 import torch
 
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, LayerNorm
 from torch.nn import Linear,Sequential,ReLU,ELU,Dropout
 from torch_geometric.data import Data
 import torch.nn.functional as F
@@ -57,7 +57,7 @@ class GAT_Numbering_Corrector_V2(torch.nn.Module):
      - 优化最后的分类层
     """
 
-    def __init__(self,in_channels=55,hidden_channels=128,out_channels=49,heads=4,dropout_rate=0.2):
+    def __init__(self,in_channels=1030,hidden_channels=128,out_channels=49,heads=4,dropout_rate=0.2):
         """
 
         :param in_channels:
@@ -129,9 +129,11 @@ class GAT_Numbering_Corrector_V3(torch.nn.Module):
 
         # 1. 扩展 1030-> 256 * heads
         self.conv1 = GATv2Conv(in_channels,hidden_channels,heads=heads)
+        self.norm1 = LayerNorm(hidden_channels * heads)
 
         #2. 256 * heads ->256 * heads
         self.conv2 = GATv2Conv(hidden_channels* heads,hidden_channels,heads=heads)
+        self.norm2 = LayerNorm(hidden_channels * heads)
 
         # #3. 【新增】第三层GAT，增加网络深度（可做实验验证是否有效）
         # self.conv3 = GATv2Conv(hidden_channels * heads,hidden_channels,heads=heads)
@@ -151,10 +153,13 @@ class GAT_Numbering_Corrector_V3(torch.nn.Module):
         x,edge_index = data.x,data.edge_index
 
         x = self.conv1(x,edge_index)
+        x = self.norm1(x)
         x = F.elu(x)
         x = F.dropout(x,p=self.dropout_rate,training=self.training)
 
         x = self.conv2(x,edge_index)
+        x = self.norm2(x)
+
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout_rate, training=self.training)
 
