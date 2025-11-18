@@ -4,22 +4,22 @@ import torch
 from torch_geometric.data import DataLoader
 
 from focal_loss import FocalLoss
-from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2
+from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2, GAT_Numbering_Corrector_V3
 from util import calculate_weights
 import logging
 import os
 import pickle
 
 # --- 配置 ---
-BEST_MODEL_PATH = 'checkpoints/best_model.pth'
-TEST_DATA_PATH = 'gnn_test_data.pt'
+BEST_MODEL_PATH = 'checkpoints/2025-10-17_17-07-50_V3_16_embedding/best_model.pth'
+TEST_DATA_PATH = 'data/gnn_test_data_0.3.pt'
 
 OUTPUT_RESULTS_PATH = 'gnn_corrected_results.pkl'
 
 BATCH_SIZE = 128
 INPUT_CHANNELS = 55
-INPUT_CHANNELS_V3 = 1030
-HIDDEN_CHANNELS = 128
+#INPUT_CHANNELS_V3 = 1030
+HIDDEN_CHANNELS = 256
 OUTPUT_CHANNELS = 49
 HEADS = 4
 DROPOUT_RATE = 0.2 # 如果你用了V2模型，确保这个值匹配
@@ -123,18 +123,25 @@ def main():
         return
 
     logging.info(f"正在加载测试数据从: {TEST_DATA_PATH}")
-    test_data_list = torch.load(TEST_DATA_PATH)
+    test_data_list = torch.load(TEST_DATA_PATH,weights_only=False)
     test_loader = DataLoader(test_data_list, batch_size=BATCH_SIZE, shuffle=False)
 
     # --- 2. 初始化模型 ---
     logging.info(f"正在初始化模型...")
     if USE_V2_MODEL:
-        model = GAT_Numbering_Corrector_V2(
+        # model = GAT_Numbering_Corrector_V2(
+        #     in_channels=INPUT_CHANNELS,
+        #     hidden_channels=HIDDEN_CHANNELS,
+        #     out_channels=OUTPUT_CHANNELS,
+        #     heads=HEADS,
+        #     dropout_rate=DROPOUT_RATE
+        # ).to(device)
+        model = GAT_Numbering_Corrector_V3(
             in_channels=INPUT_CHANNELS,
             hidden_channels=HIDDEN_CHANNELS,
             out_channels=OUTPUT_CHANNELS,
             heads=HEADS,
-            dropout_rate=DROPOUT_RATE
+            dropout_rate=0.5
         ).to(device)
         logging.info("使用了 V2 模型 (3层, MLP头)")
     else:

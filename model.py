@@ -1,6 +1,6 @@
 import torch
 
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, LayerNorm,TransformerConv,global_mean_pool
 from torch.nn import Linear,Sequential,ReLU,ELU,Dropout
 from torch_geometric.data import Data
 import torch.nn.functional as F
@@ -57,7 +57,7 @@ class GAT_Numbering_Corrector_V2(torch.nn.Module):
      - 优化最后的分类层
     """
 
-    def __init__(self,in_channels=55,hidden_channels=128,out_channels=49,heads=4,dropout_rate=0.2):
+    def __init__(self,in_channels=1030,hidden_channels=128,out_channels=49,heads=4,dropout_rate=0.2):
         """
 
         :param in_channels:
@@ -129,9 +129,11 @@ class GAT_Numbering_Corrector_V3(torch.nn.Module):
 
         # 1. 扩展 1030-> 256 * heads
         self.conv1 = GATv2Conv(in_channels,hidden_channels,heads=heads)
+        self.norm1 = LayerNorm(hidden_channels * heads)
 
         #2. 256 * heads ->256 * heads
         self.conv2 = GATv2Conv(hidden_channels* heads,hidden_channels,heads=heads)
+        self.norm2 = LayerNorm(hidden_channels * heads)
 
         # #3. 【新增】第三层GAT，增加网络深度（可做实验验证是否有效）
         # self.conv3 = GATv2Conv(hidden_channels * heads,hidden_channels,heads=heads)
@@ -151,13 +153,100 @@ class GAT_Numbering_Corrector_V3(torch.nn.Module):
         x,edge_index = data.x,data.edge_index
 
         x = self.conv1(x,edge_index)
+        x = self.norm1(x)
         x = F.elu(x)
         x = F.dropout(x,p=self.dropout_rate,training=self.training)
 
         x = self.conv2(x,edge_index)
+        x = self.norm2(x)
+
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout_rate, training=self.training)
 
         out = self.classifier(x)
 
         return out
+
+
+class BaselineGNN(torch.nn.Module):
+    def __init__(self,n_classes):
+        super(BaselineGNN,self).__init__()
+
+        #  多模态输入
+        self.visual_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1024,128),
+            torch.nn.ReLU(),
+            LayerNorm(128)
+        )
+
+        self.geom_encoder = torch.nn.Sequential(
+            torch.nn.Linear(6,128),
+            torch.nn.ReLU(),
+            LayerNorm(128)
+        )
+
+        self.prior_encoder = torch.nn.Sequential(
+            torch.nn.Linear(50,128),
+            torch.nn.ReLU(),
+            LayerNorm(128)
+        )
+        self.fused_node_dim = 384 # 128 * 3
+
+
+        #   边特征处理
+        self.edge_feature_dim = 3 # [长度，角度x，角度y]
+        self.encoded_edge_dim = 128
+
+        self.edge_encoder = torch.nn.Sequential(
+            torch.nn.Linear(self.edge_feature_dim,self.encoded_edge_dim),
+            torch.nn.ReLU(),
+            LayerNorm(self.encoded_edge_dim)
+        )
+
+
+        # GNN处理
+        self.gnn_layer_1 = TransformerConv(
+            self.fused_node_dim,48,heads=8,concat=True,
+            edge_dim=self.encoded_edge_dim
+        )
+        self.gnn_norm_1 = LayerNorm(self.fused_node_dim)
+
+        self.gnn_layer_2 = TransformerConv(
+            self.fused_node_dim,48,heads=8,concat=True,
+            edge_dim=self.encoded_edge_dim
+        )
+        self.gnn_norm_2 = LayerNorm(self.fused_node_dim)
+
+        # 分类器头部
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_node_dim,128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(128,49)
+        )
+
+
+    def forward(self,data):
+        # 数据
+        x_graph,x_visual,x_prior = data.x_graph,data.x_visual,data.x_prior
+        edge_index,batch = data.edge_index,data.batch
+        edge_attr = data.edge_attr
+
+        # 特征编码+融合
+        h_visual = self.visual_encoder(x_visual)
+        h_geom = self.geom_encoder(x_graph)
+        h_prior = self.prior_encoder(x_prior)
+        h_0 = torch.cat([h_visual,h_geom,h_prior],dim=-1)
+
+        #边
+        encoded_edge_attr = self.edge_encoder(edge_attr)
+
+        h_1 = h_0 + F.elu(self.gnn_layer_1(h_0,edge_index,encoded_edge_attr))
+        h_1 = self.gnn_norm_1(h_1,batch)
+
+        h_2 = h_1 + F.elu(self.gnn_layer_2(h_1,edge_index,encoded_edge_attr))
+        h_2 = self.gnn_norm_2(h_2,batch)
+
+        logits = self.classifier(h_2)
+
+        return logits
