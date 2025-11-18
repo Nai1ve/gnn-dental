@@ -1,7 +1,7 @@
 import logging
 import os
 import torch.optim
-from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2, GAT_Numbering_Corrector_V3,BaselineGNN
+from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2, GAT_Numbering_Corrector_V3,BaselineGNN,AnatomyGAT
 from focal_loss import FocalLoss
 from util import calculate_weights
 from torch_geometric.loader import DataLoader
@@ -21,9 +21,11 @@ CONFUSION_SET_CLASSES = {
 }
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #data_path = 'data/gnn_train_data_with_visual_embedding_0.3.pt'
-data_path = 'gnn_data/train.pt'
+#data_path = 'gnn_data/train.pt'
+data_path = 'gnn_data/train_v2.pt'
 #val_data_path = 'data/gnn_val_data_with_visual_embedding_0.3.pt'
-val_data_path = 'gnn_data/val.pt'
+#val_data_path = 'gnn_data/val.pt'
+val_data_path = 'gnn_data/val_v2.pt'
 N_CLASSES = 49
 model_save_dir = f'checkpoints/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}/'
 os.makedirs(model_save_dir, exist_ok=True)
@@ -83,9 +85,8 @@ def validate_epoch(model,loader,criterion):
 
         # 2. 计算混淆集准确率 (如我们详细讨论的)
         # 找到所有真实标签属于“混淆集”的节点
-        mask = torch.tensor([y_item in CONFUSION_SET_CLASSES for y_item in y_true.cpu()],
+        mask = torch.tensor([y_item.item() in CONFUSION_SET_CLASSES for y_item in y_true.cpu()],
                             dtype=torch.bool).to(device)
-
         if mask.sum() > 0:
             correct_nodes_confusion += int((pred[mask] == batch.y[mask]).sum())
             total_nodes_confusion += int(mask.sum())
@@ -144,7 +145,8 @@ def main():
     logging.info(f"监控的混淆集类别: {CONFUSION_SET_CLASSES}")
 
     # --- 1. 实例化模型 ---
-    model = BaselineGNN(n_classes=N_CLASSES).to(device)
+    #model = BaselineGNN(n_classes=N_CLASSES).to(device)
+    model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3)
     logging.info(f"模型 {type(model).__name__} 已实例化 (n_classes={N_CLASSES})")
 
     # 打印模型结构 (可选，但有助于调试)

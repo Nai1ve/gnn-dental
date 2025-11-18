@@ -1,6 +1,6 @@
 import torch
 
-from torch_geometric.nn import GATv2Conv, LayerNorm,TransformerConv,global_mean_pool
+from torch_geometric.nn import GATv2Conv, LayerNorm,TransformerConv,global_mean_pool,RGATConv
 from torch.nn import Linear,Sequential,ReLU,ELU,Dropout
 from torch_geometric.data import Data
 import torch.nn.functional as F
@@ -247,6 +247,115 @@ class BaselineGNN(torch.nn.Module):
         h_2 = h_1 + F.elu(self.gnn_layer_2(h_1,edge_index,encoded_edge_attr))
         h_2 = self.gnn_norm_2(h_2,batch)
 
+        logits = self.classifier(h_2)
+
+        return logits
+
+class AnatomyGAT(torch.nn.Module):
+    def __init__(self, n_classes, num_relations=3):
+        """
+        AnatomyGAT: 解剖学感知的图神经网络
+
+        参数:
+            n_classes: 类别数 (49)
+            num_relations: 边的类型数量 (这里是 3: Overlap, Arch, Spatial)
+        """
+        super(AnatomyGAT, self).__init__()
+
+        # --- 1. 多模态输入编码器  ---
+
+        self.visual_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.geom_encoder = torch.nn.Sequential(
+            torch.nn.Linear(6, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        # 先验特征维度是 50 (49类 + 1置信度)
+        self.prior_encoder = torch.nn.Sequential(
+            torch.nn.Linear(n_classes + 1, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+
+        # 融合后的节点特征维度
+        self.fused_dim = 128 * 3  # 384
+
+        # --- 2. 关系 GAT 核心 (RGAT) ---
+        # [核心创新点] 使用 RGATConv 替代 TransformerConv/GATv2
+        # 它可以处理 edge_type
+
+        self.rgat_layer_1 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,  # 告诉它有3种边
+            heads=8,
+            concat=True,
+            # 这里的 dropout 是注意力系数的 dropout
+            dropout=0.2
+        )
+        self.norm_1 = LayerNorm(self.fused_dim)
+
+        self.rgat_layer_2 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8,
+            concat=True,
+            dropout=0.2
+        )
+        self.norm_2 = LayerNorm(self.fused_dim)
+
+        # --- 3. 分类器头部 (与 Baseline 相同) ---
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(128, n_classes)
+        )
+
+    def forward(self, data):
+        # 1. 解包数据
+        x_visual, x_geom, x_prior = data.x_visual, data.x_geom, data.x_prior
+
+        # 2. [关键步骤] 合并三种边并生成 edge_type
+        # 我们需要在 forward 里把数据里分离的边合并成 RGAT 需要的格式
+        edge_index_overlap = data.edge_index_overlap
+        edge_index_arch = data.edge_index_arch
+        edge_index_spatial = data.edge_index_spatial
+
+        # 定义关系 ID (0, 1, 2)
+        # 0: Overlap (抑制)
+        # 1: Arch (横向/牙弓)
+        # 2: Spatial (纵向/空间)
+
+        # 生成 edge_type 向量
+        type_overlap = torch.zeros(edge_index_overlap.size(1), dtype=torch.long, device=data.x_visual.device)
+        type_arch = torch.ones(edge_index_arch.size(1), dtype=torch.long, device=data.x_visual.device)
+        type_spatial = torch.full((edge_index_spatial.size(1),), 2, dtype=torch.long, device=data.x_visual.device)
+
+        # 拼接 edge_index 和 edge_type
+        edge_index = torch.cat([edge_index_overlap, edge_index_arch, edge_index_spatial], dim=1)
+        edge_type = torch.cat([type_overlap, type_arch, type_spatial], dim=0)
+
+        # 3. 编码节点特征
+        h_visual = self.visual_encoder(x_visual)
+        h_geom = self.geom_encoder(x_geom)
+        h_prior = self.prior_encoder(x_prior)
+        h_0 = torch.cat([h_visual, h_geom, h_prior], dim=-1)  # [N, 384]
+
+        # 4. RGAT 消息传递
+        # Layer 1
+        # 注意：RGATConv 需要传入 edge_type
+        h_1 = self.rgat_layer_1(h_0, edge_index, edge_type)
+        h_1 = F.elu(h_1)
+        h_1 = h_0 + h_1  # 残差连接
+        h_1 = self.norm_1(h_1, data.batch)
+
+        # Layer 2
+        h_2 = self.rgat_layer_2(h_1, edge_index, edge_type)
+        h_2 = F.elu(h_2)
+        h_2 = h_1 + h_2  # 残差连接
+        h_2 = self.norm_2(h_2, data.batch)
+
+        # 5. 分类
         logits = self.classifier(h_2)
 
         return logits
