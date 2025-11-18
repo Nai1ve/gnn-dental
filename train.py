@@ -146,7 +146,7 @@ def main():
 
     # --- 1. 实例化模型 ---
     #model = BaselineGNN(n_classes=N_CLASSES).to(device)
-    model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3)
+    model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3).to(device)
     logging.info(f"模型 {type(model).__name__} 已实例化 (n_classes={N_CLASSES})")
 
     # 打印模型结构 (可选，但有助于调试)
@@ -157,8 +157,8 @@ def main():
     # --- 2. 准备数据 ---
     try:
         # map_location=device 可以在加载时就将数据移动到GPU (如果可用)
-        train_data_list = torch.load(data_path, map_location='cpu', weights_only=False)
-        val_data_list = torch.load(val_data_path, map_location='cpu', weights_only=False)
+        train_data_list = torch.load(data_path, map_location=device, weights_only=False)
+        val_data_list = torch.load(val_data_path, map_location=device, weights_only=False)
     except FileNotFoundError as e:
         logging.error(f"数据文件未找到: {e}")
         logging.error("请确保 'gnn_data/train.pt' 和 'gnn_data/val.pt' 存在。")
