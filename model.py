@@ -359,3 +359,117 @@ class AnatomyGAT(torch.nn.Module):
         logits = self.classifier(h_2)
 
         return logits
+
+
+class RecurrentAnatomyGAT(torch.nn.Module):
+    def __init__(self, n_classes, num_relations=3, num_iterations=3):
+        """
+        RecurrentAnatomyGAT: 迭代式解剖学感知图神经网络
+
+        参数:
+            num_iterations: 迭代推理的次数 (建议 2 或 3)
+        """
+        super(RecurrentAnatomyGAT, self).__init__()
+
+        self.n_classes = n_classes
+        self.num_iterations = num_iterations
+
+        # --- 1. 编码器 (权重共享) ---
+        self.visual_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.geom_encoder = torch.nn.Sequential(
+            torch.nn.Linear(6, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        # 先验编码器：处理 [N, 50] 的向量
+        self.prior_encoder = torch.nn.Sequential(
+            torch.nn.Linear(n_classes + 1, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+
+        self.fused_dim = 128 * 3  # 384
+
+        # --- 2. 关系 GAT 核心 (权重共享) ---
+        # 在所有迭代步中，我们使用同一套 GNN 权重
+        # 这迫使模型学习通用的"修正逻辑"，而不是死记硬背
+
+        self.rgat_layer_1 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8, concat=True, dropout=0.2
+        )
+        self.norm_1 = LayerNorm(self.fused_dim)
+
+        self.rgat_layer_2 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8, concat=True, dropout=0.2
+        )
+        self.norm_2 = LayerNorm(self.fused_dim)
+
+        # --- 3. 分类器 (权重共享) ---
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(128, n_classes)
+        )
+
+    def forward(self, data):
+        device = data.x_visual.device
+
+        # 1. 准备边信息 (只做一次)
+        edge_index_overlap = data.edge_index_overlap.to(device)
+        edge_index_arch = data.edge_index_arch.to(device)
+        edge_index_spatial = data.edge_index_spatial.to(device)
+
+        type_overlap = torch.zeros(edge_index_overlap.size(1), dtype=torch.long, device=device)
+        type_arch = torch.ones(edge_index_arch.size(1), dtype=torch.long, device=device)
+        type_spatial = torch.full((edge_index_spatial.size(1),), 2, dtype=torch.long, device=device)
+
+        edge_index = torch.cat([edge_index_overlap, edge_index_arch, edge_index_spatial], dim=1)
+        edge_type = torch.cat([type_overlap, type_arch, type_spatial], dim=0)
+
+        # 2. 编码静态特征 (只做一次)
+        h_visual = self.visual_encoder(data.x_visual)
+        h_geom = self.geom_encoder(data.x_geom)
+
+        # 3. 初始化动态信念 (Time step 0)
+        # 初始信念来自检测器的原始输出
+        current_prior_input = data.x_prior
+
+        final_logits = None
+
+        # --- 4. 迭代循环 (Recurrent Loop) ---
+        for t in range(self.num_iterations):
+            # A. 编码当前信念
+            h_prior = self.prior_encoder(current_prior_input)
+
+            # B. 融合
+            h_0 = torch.cat([h_visual, h_geom, h_prior], dim=-1)  # [N, 384]
+
+            # C. RGAT 消息传递 (权重共享)
+            h_1 = self.rgat_layer_1(h_0, edge_index, edge_type)
+            h_1 = F.elu(h_1) + h_0
+            h_1 = self.norm_1(h_1, data.batch)
+
+            h_2 = self.rgat_layer_2(h_1, edge_index, edge_type)
+            h_2 = F.elu(h_2) + h_1
+            h_2 = self.norm_2(h_2, data.batch)
+
+            # D. 计算当前步的输出
+            logits = self.classifier(h_2)  # [N, 49]
+            final_logits = logits
+
+            # E. 更新下一次迭代的信念 (如果不是最后一步)
+            if t < self.num_iterations - 1:
+                # Softmax 获取概率分布
+                probs = F.softmax(logits, dim=1)  # [N, 49]
+                # 获取最大置信度
+                confidence, _ = torch.max(probs, dim=1, keepdim=True)  # [N, 1]
+                # 拼接成新的 x_prior [N, 50]
+                # 这就是"信念传播"：GNN现在的输出变成了下一轮的输入
+                current_prior_input = torch.cat([probs, confidence], dim=1)
+
+        return final_logits

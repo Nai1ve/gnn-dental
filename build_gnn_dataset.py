@@ -36,6 +36,7 @@ IOU_THRESHOLD = 0.5
 # ==============================================================================
 def build_multi_relation_graph(boxes, node_centers,
                                iou_threshold=0.4,
+                               ios_threshold = 0.8,
                                k_arch=2,
                                k_spatial=9,
                                y_penalty=3.0):  # [调整] 建议 3.0 - 5.0
@@ -55,8 +56,17 @@ def build_multi_relation_graph(boxes, node_centers,
     # --- A. IoU 矩阵 (用于重叠边) ---
     iou_matrix = torchvision.ops.box_iou(boxes, boxes)
 
+    # --- 新增：计算IoS矩阵
+    area = (boxes[:,2] - boxes[:,0]) * (boxes[:,3] - boxes[:,1])
+    lt = torch.max(boxes[:,None,:2],boxes[:,:2])
+    rb = torch.min(boxes[:,None,2:],boxes[:,2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:,:,0] * wh[:,:,1]
+    min_area = torch.min(area[:,None],area[None,:])
+    ios_matrix = inter / (min_area + 1e-6)
+
     # --- B. 构建 edge_index_overlap (重叠边) ---
-    mask_overlap = (iou_matrix > iou_threshold)
+    mask_overlap = (iou_matrix > iou_threshold) | (ios_matrix > ios_threshold)
     mask_overlap.fill_diagonal_(False)
     edge_index_overlap = mask_overlap.nonzero(as_tuple=False).t().contiguous()
 
@@ -159,7 +169,7 @@ def generate_gnn_y_labels_local(pred_bboxes_np, pred_scores_np,
 # ==============================================================================
 def build_graph_from_features(raw_data: dict, gt_data: dict,
                               k_neighbors: int, min_score_threshold: int,
-                              iou_threshold_graph: float, y_penalty: float) -> Optional[Data]:
+                              iou_threshold_graph: float, y_penalty: float,ios_threshold_graph:float) -> Optional[Data]:
     """
     从原始特征构建单个 AnatomyGAT Data对象。
     """
@@ -250,7 +260,8 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         boxes=final_bboxes_tensor,  # xyxy
         node_centers=pos,  # cx, cy
         iou_threshold=iou_threshold_graph,
-        k_arch=2,  # 牙弓找左右邻居
+        ios_threshold=ios_threshold_graph,
+        k_arch=4,  # 牙弓找左右邻居
         k_spatial=k_neighbors,  # 空间找 k 个
         y_penalty=y_penalty  # 垂直惩罚
     )
@@ -302,6 +313,7 @@ def main():
     # GNN 构建参数
     parser.add_argument('-k', '--k-neighbors', type=int, default=9, help="空间边的 k 值 (k_spatial)")
     parser.add_argument('--iou-threshold', type=float, default=0.4, help="重叠边的 IoU 阈值")
+    parser.add_argument('--ios-threshold', type=float, default=0.8, help="重叠边的 IoU 阈值")
     parser.add_argument('--y-penalty', type=float, default=3.0, help="牙弓边的垂直距离惩罚系数")
     parser.add_argument('-confidence', type=float, default=0.3, help='节点置信度过滤阈值')
 
@@ -362,7 +374,8 @@ def main():
                 k_neighbors=args.k_neighbors,
                 min_score_threshold=args.confidence,
                 iou_threshold_graph=args.iou_threshold,
-                y_penalty=args.y_penalty
+                y_penalty=args.y_penalty,
+                ios_threshold_graph=args.ios_threshold
             )
             if gnn_data is not None:
                 final_gnn_list.append(gnn_data)

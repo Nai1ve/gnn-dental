@@ -1,7 +1,7 @@
 import logging
 import os
 import torch.optim
-from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2, GAT_Numbering_Corrector_V3,BaselineGNN,AnatomyGAT
+from model import GAT_Numbering_Corrector, GAT_Numbering_Corrector_V2, GAT_Numbering_Corrector_V3,BaselineGNN,AnatomyGAT,RecurrentAnatomyGAT
 from focal_loss import FocalLoss
 from util import calculate_weights
 from torch_geometric.loader import DataLoader
@@ -146,7 +146,8 @@ def main():
 
     # --- 1. 实例化模型 ---
     #model = BaselineGNN(n_classes=N_CLASSES).to(device)
-    model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3)
+    #model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3)
+    model = RecurrentAnatomyGAT(n_classes=N_CLASSES,num_relations=3,num_iterations=3)
     logging.info(f"模型 {type(model).__name__} 已实例化 (n_classes={N_CLASSES})")
 
     # 打印模型结构 (可选，但有助于调试)
