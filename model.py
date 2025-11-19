@@ -228,13 +228,13 @@ class BaselineGNN(torch.nn.Module):
 
     def forward(self,data):
         # 数据
-        x_graph,x_visual,x_prior = data.x_graph,data.x_visual,data.x_prior
+        x_geom,x_visual,x_prior = data.x_geom,data.x_visual,data.x_prior
         edge_index,batch = data.edge_index,data.batch
         edge_attr = data.edge_attr
 
         # 特征编码+融合
         h_visual = self.visual_encoder(x_visual)
-        h_geom = self.geom_encoder(x_graph)
+        h_geom = self.geom_encoder(x_geom)
         h_prior = self.prior_encoder(x_prior)
         h_0 = torch.cat([h_visual,h_geom,h_prior],dim=-1)
 
@@ -252,7 +252,7 @@ class BaselineGNN(torch.nn.Module):
         return logits
 
 class AnatomyGAT(torch.nn.Module):
-    def __init__(self, n_classes, num_relations=3):
+    def __init__(self, n_classes,num_relations=3):
         """
         AnatomyGAT: 解剖学感知的图神经网络
 
@@ -314,12 +314,12 @@ class AnatomyGAT(torch.nn.Module):
     def forward(self, data):
         # 1. 解包数据
         x_visual, x_geom, x_prior = data.x_visual, data.x_geom, data.x_prior
-
+        device = data.x_visual.device
         # 2. [关键步骤] 合并三种边并生成 edge_type
         # 我们需要在 forward 里把数据里分离的边合并成 RGAT 需要的格式
-        edge_index_overlap = data.edge_index_overlap
-        edge_index_arch = data.edge_index_arch
-        edge_index_spatial = data.edge_index_spatial
+        edge_index_overlap = data.edge_index_overlap.to(device)
+        edge_index_arch = data.edge_index_arch.to(device)
+        edge_index_spatial = data.edge_index_spatial.to(device)
 
         # 定义关系 ID (0, 1, 2)
         # 0: Overlap (抑制)
@@ -327,9 +327,9 @@ class AnatomyGAT(torch.nn.Module):
         # 2: Spatial (纵向/空间)
 
         # 生成 edge_type 向量
-        type_overlap = torch.zeros(edge_index_overlap.size(1), dtype=torch.long, device=data.x_visual.device)
-        type_arch = torch.ones(edge_index_arch.size(1), dtype=torch.long, device=data.x_visual.device)
-        type_spatial = torch.full((edge_index_spatial.size(1),), 2, dtype=torch.long, device=data.x_visual.device)
+        type_overlap = torch.zeros(edge_index_overlap.size(1), dtype=torch.long, device=device)
+        type_arch = torch.ones(edge_index_arch.size(1), dtype=torch.long,device=device)
+        type_spatial = torch.full((edge_index_spatial.size(1),), 2, dtype=torch.long,device=device)
 
         # 拼接 edge_index 和 edge_type
         edge_index = torch.cat([edge_index_overlap, edge_index_arch, edge_index_spatial], dim=1)
