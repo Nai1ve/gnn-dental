@@ -435,11 +435,12 @@ class RecurrentAnatomyGAT(torch.nn.Module):
         h_visual = self.visual_encoder(data.x_visual)
         h_geom = self.geom_encoder(data.x_geom)
 
+        all_step_logits = []
+
         # 3. 初始化动态信念 (Time step 0)
         # 初始信念来自检测器的原始输出
         current_prior_input = data.x_prior
 
-        final_logits = None
 
         # --- 4. 迭代循环 (Recurrent Loop) ---
         for t in range(self.num_iterations):
@@ -460,7 +461,7 @@ class RecurrentAnatomyGAT(torch.nn.Module):
 
             # D. 计算当前步的输出
             logits = self.classifier(h_2)  # [N, 49]
-            final_logits = logits
+            all_step_logits.append(logits)
 
             # E. 更新下一次迭代的信念 (如果不是最后一步)
             if t < self.num_iterations - 1:
@@ -472,4 +473,4 @@ class RecurrentAnatomyGAT(torch.nn.Module):
                 # 这就是"信念传播"：GNN现在的输出变成了下一轮的输入
                 current_prior_input = torch.cat([probs, confidence], dim=1)
 
-        return final_logits
+        return all_step_logits

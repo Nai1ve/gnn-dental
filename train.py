@@ -49,11 +49,17 @@ def train_epoch(model,loader,criterion,optimizer):
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad()
-        out = model(batch)
-        loss = criterion(out,batch.y.long())
-        loss.backward()
+        all_step_logits = model(batch)
+
+        batch_loss = 0
+        y_true = batch.y.long()
+
+        for logits in all_step_logits:
+            batch_loss += criterion(logits,y_true)
+
+        batch_loss.backward()
         optimizer.step()
-        total_loss += loss.item() * batch.num_graphs
+        total_loss += batch_loss.item() * batch.num_graphs
 
     return total_loss / len(loader.dataset)
 
@@ -72,7 +78,10 @@ def validate_epoch(model,loader,criterion):
 
     for batch in loader:
         batch = batch.to(device)
-        out = model(batch)
+        all_step_logits = model(batch)
+
+        out = all_step_logits[-1]
+
         loss = criterion(out, batch.y.long())
         total_loss += loss.item() * batch.num_graphs
 
@@ -146,8 +155,8 @@ def main():
 
     # --- 1. 实例化模型 ---
     #model = BaselineGNN(n_classes=N_CLASSES).to(device)
-    #model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3)
-    model = RecurrentAnatomyGAT(n_classes=N_CLASSES,num_relations=3,num_iterations=3)
+    #model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3).to(device)
+    model = RecurrentAnatomyGAT(n_classes=N_CLASSES,num_relations=3,num_iterations=3).to(device)
     logging.info(f"模型 {type(model).__name__} 已实例化 (n_classes={N_CLASSES})")
 
     # 打印模型结构 (可选，但有助于调试)
