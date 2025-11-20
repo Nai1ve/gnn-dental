@@ -36,62 +36,72 @@ IOU_THRESHOLD = 0.5
 # ==============================================================================
 def build_multi_relation_graph(boxes, node_centers,
                                iou_threshold=0.4,
-                               ios_threshold = 0.8,
+                               ios_threshold=0.8,
                                k_arch=2,
                                k_spatial=9,
-                               y_penalty=3.0):  # [调整] 建议 3.0 - 5.0
+                               y_penalty=3.0,
+                               k_vertical=1,  # [新增参数] 纵向视野
+                               x_penalty=5.0):  # [新增参数] X轴惩罚系数
     """
-    构建三种解耦的边关系。
-    输入:
-        boxes: [N, 4] (x1, y1, x2, y2) 绝对像素坐标
-        node_centers: [N, 2] (cx, cy) 绝对像素坐标
+    构建四种解耦的边关系 (V5.1)。
     """
     N = boxes.shape[0]
     device = boxes.device
 
     if N < 2:
         empty_edge = torch.empty((2, 0), dtype=torch.long, device=device)
-        return empty_edge, empty_edge, empty_edge
+        # 返回4个空边
+        return empty_edge, empty_edge, empty_edge, empty_edge
 
-    # --- A. IoU 矩阵 (用于重叠边) ---
+    # =========================================================
+    # A. 基础矩阵计算
+    # =========================================================
+
+    # 1. IoU 矩阵
     iou_matrix = torchvision.ops.box_iou(boxes, boxes)
 
-    # --- 新增：计算IoS矩阵
-    area = (boxes[:,2] - boxes[:,0]) * (boxes[:,3] - boxes[:,1])
-    lt = torch.max(boxes[:,None,:2],boxes[:,:2])
-    rb = torch.min(boxes[:,None,2:],boxes[:,2:])
+    # 2. IoS (Intersection over Smaller) 矩阵 - 用于解决大牙套小框
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    lt = torch.max(boxes[:, None, :2], boxes[:, :2])
+    rb = torch.min(boxes[:, None, 2:], boxes[:, 2:])
     wh = (rb - lt).clamp(min=0)
-    inter = wh[:,:,0] * wh[:,:,1]
-    min_area = torch.min(area[:,None],area[None,:])
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    min_area = torch.min(area[:, None], area[None, :])
     ios_matrix = inter / (min_area + 1e-6)
 
-    # --- B. 构建 edge_index_overlap (重叠边) ---
+    # =========================================================
+    # B. 构建 edge_index_overlap (Type 0: 重叠/抑制边)
+    # =========================================================
+
+    # 逻辑: IoU > 阈值 OR IoS > 阈值
     mask_overlap = (iou_matrix > iou_threshold) | (ios_matrix > ios_threshold)
     mask_overlap.fill_diagonal_(False)
     edge_index_overlap = mask_overlap.nonzero(as_tuple=False).t().contiguous()
 
-    # --- C. 构建 edge_index_arch (牙弓边 - V4.1 各向异性) ---
-    # 1. 各向异性坐标变换 (拉伸Y轴，惩罚垂直距离)
-    scaled_centers = node_centers.clone()
-    scaled_centers[:, 1] *= y_penalty
+    # 定义通用禁止掩码 (重叠的和自己的，都不能是解剖邻居)
+    mask_forbidden_base = mask_overlap | torch.eye(N, dtype=torch.bool, device=device)
 
-    # 2. 计算各向异性距离矩阵
-    arch_dist_matrix = torch.cdist(scaled_centers, scaled_centers, p=2)
+    # =========================================================
+    # C. 构建 edge_index_arch (Type 1: 牙弓/横向边)
+    # =========================================================
 
-    # 3. 应用约束 (解耦: 禁止重叠边和自循环)
-    mask_forbidden_overlap = mask_overlap
-    mask_forbidden_self = torch.eye(N, dtype=torch.bool, device=device)
+    # 1. 各向异性坐标变换 (拉伸Y轴，惩罚垂直距离，强制看左右)
+    scaled_centers_arch = node_centers.clone()
+    scaled_centers_arch[:, 1] *= y_penalty
 
-    total_forbidden_mask = mask_forbidden_overlap | mask_forbidden_self
-    arch_dist_matrix[total_forbidden_mask] = float('inf')
+    # 2. 计算距离矩阵
+    arch_dist_matrix = torch.cdist(scaled_centers_arch, scaled_centers_arch, p=2)
+
+    # 3. 应用约束 (禁止重叠和自循环)
+    arch_dist_matrix[mask_forbidden_base] = float('inf')
 
     # 4. 执行 k-NN
-    curr_k = min(k_arch, N - 1)
-    if curr_k > 0:
-        dists, indices = torch.topk(arch_dist_matrix, k=curr_k, dim=1, largest=False)
+    curr_k_arch = min(k_arch, N - 1)
+    if curr_k_arch > 0:
+        dists, indices = torch.topk(arch_dist_matrix, k=curr_k_arch, dim=1, largest=False)
         valid_mask = (dists != float('inf'))
 
-        source_nodes = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k)
+        source_nodes = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k_arch)
         valid_sources = source_nodes[valid_mask]
         valid_targets = indices[valid_mask]
 
@@ -99,7 +109,50 @@ def build_multi_relation_graph(boxes, node_centers,
     else:
         edge_index_arch = torch.empty((2, 0), dtype=torch.long, device=device)
 
-    # --- D. 构建 edge_index_spatial (空间边 - 原始距离) ---
+    # =========================================================
+    # D. 构建 edge_index_vertical (Type 2: 替换牙/纵向边) [新增部分]
+    # =========================================================
+
+    # 1. 各向异性坐标变换 (拉伸X轴，惩罚水平距离，强制看上下)
+    scaled_centers_vert = node_centers.clone()
+    scaled_centers_vert[:, 0] *= x_penalty
+
+    # 2. 计算距离矩阵
+    vert_dist_matrix = torch.cdist(scaled_centers_vert, scaled_centers_vert, p=2)
+
+    # 3. 应用约束
+    # [关键] 禁止跨颌连接 (Anti-Opposing Constraint)
+    # 我们只找"同侧牙弓"内的垂直关系 (恒牙胚 <-> 乳牙)
+    y_midline = torch.median(node_centers[:, 1])
+    is_upper = (node_centers[:, 1] < y_midline)
+    is_lower = (node_centers[:, 1] >= y_midline)
+
+    # 构造跨颌掩码: 如果一个在上一个在下，则禁止连接
+    mask_cross_jaw = (is_upper.unsqueeze(1) & is_lower.unsqueeze(0))
+    mask_cross_jaw = mask_cross_jaw | mask_cross_jaw.t()  # 双向禁止
+
+    # 合并禁止项: 基础禁止 + 跨颌禁止
+    total_forbidden_vert = mask_forbidden_base | mask_cross_jaw
+    vert_dist_matrix[total_forbidden_vert] = float('inf')
+
+    # 4. 执行 k-NN (通常 k=1, 找最近的一个替换牙)
+    curr_k_vert = min(k_vertical, N - 1)
+    if curr_k_vert > 0:
+        dists, indices = torch.topk(vert_dist_matrix, k=curr_k_vert, dim=1, largest=False)
+        valid_mask = (dists != float('inf'))
+
+        source_nodes = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k_vert)
+        valid_sources = source_nodes[valid_mask]
+        valid_targets = indices[valid_mask]
+
+        edge_index_vertical = torch.stack([valid_sources, valid_targets], dim=0)
+    else:
+        edge_index_vertical = torch.empty((2, 0), dtype=torch.long, device=device)
+
+    # =========================================================
+    # E. 构建 edge_index_spatial (Type 3: 空间/兜底边)
+    # =========================================================
+
     # 使用原始 node_centers
     spatial_dist_matrix = torch.cdist(node_centers, node_centers, p=2)
     spatial_dist_matrix.fill_diagonal_(float('inf'))
@@ -110,7 +163,8 @@ def build_multi_relation_graph(boxes, node_centers,
     source_nodes_sp = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k_sp)
     edge_index_spatial = torch.stack([source_nodes_sp.flatten(), indices_sp.flatten()], dim=0)
 
-    return edge_index_overlap, edge_index_arch, edge_index_spatial
+    # 返回 4 种边
+    return edge_index_overlap, edge_index_arch, edge_index_vertical, edge_index_spatial
 
 
 # ==============================================================================
@@ -201,7 +255,6 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         pred_bboxes_np, pred_scores_np, gt_bboxes_np, gt_labels_np
     )
     y = y_vector_np[score_mask]
-    # [关键] 使用 LongTensor
     y_tensor = torch.tensor(y, dtype=torch.long)
 
     # 3. 特征工程
@@ -215,12 +268,19 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
     feature_list_prior = []
     pos_list = []  # 绝对像素坐标 center_x, center_y
 
+    # 计算所有框的中心点
+    centers_x = (final_bboxes_tensor[:, 0] + final_bboxes_tensor[:, 2]) / 2
+    centers_y = (final_bboxes_tensor[:, 1] + final_bboxes_tensor[:, 3]) / 2
+    pos_abs = torch.stack([centers_x, centers_y], dim=1)  # [N, 2]
+
+    # 计算重心
+    centroid = torch.mean(pos_abs, dim=0)  # [mean_x, mean_y]
+
     for i in range(num_preds):
         bbox = final_bboxes_tensor[i]  # xyxy
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        x_center = bbox[0] + w / 2
-        y_center = bbox[1] + h / 2
+        x_center, y_center= centers_x[i],centers_y[i]
         aspect_ratio = w / (h + 1e-6)
 
         # 几何特征归一化
@@ -231,11 +291,21 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         confidence_score = final_scores_tensor[i].unsqueeze(0) * 2 - 1
         pred_all_class_prob = final_pred_all_class_probs[i]
 
-        # 几何特征 (6维: cx, cy, w, h, area, ratio)
+        # [新增特征] 重心相对坐标 (2维) -> 总共 8维
+        delta_x = x_center - centroid[0]
+        delta_y = y_center - centroid[1]
+        rel_coord = torch.tensor([
+            (delta_x / img_w) * 2,  # 归一化
+            (delta_y / img_h) * 2
+        ])
+
+
+        # 几何特征 (8维: cx, cy, w, h, area, ratio,x重心，y重心)
         x_g = torch.cat([
             geom_shape_features,  # 4D
             area_feature,  # 1D
-            aspect_ratio_features  # 1D
+            aspect_ratio_features,  # 1D
+            rel_coord# 2D
         ])
         feature_list_graph.append(x_g)
 
@@ -255,15 +325,17 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
 
     pos = torch.stack(pos_list).float()  # [N, 2] 绝对像素坐标 (用于构图)
 
-    # --- [!! 核心修改 !!] 调用 V4.1 构图算法 ---
-    edge_overlap, edge_arch, edge_spatial = build_multi_relation_graph(
+    # 调用 构图算法 ---
+    edge_overlap, edge_arch, e_vert,edge_spatial = build_multi_relation_graph(
         boxes=final_bboxes_tensor,  # xyxy
         node_centers=pos,  # cx, cy
         iou_threshold=iou_threshold_graph,
         ios_threshold=ios_threshold_graph,
         k_arch=4,  # 牙弓找左右邻居
         k_spatial=k_neighbors,  # 空间找 k 个
-        y_penalty=y_penalty  # 垂直惩罚
+        y_penalty=y_penalty,  # 垂直惩罚
+        k_vertical=1,#替换牙数量
+        x_penalty=5.0
     )
 
     # 归一化位置 (用于可视化或额外的几何特征，如果需要)
@@ -281,6 +353,7 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         # 边索引 (三种类型)
         edge_index_overlap=edge_overlap,
         edge_index_arch=edge_arch,
+        edge_index_vertical=e_vert,
         edge_index_spatial=edge_spatial,
 
         # 标签和元数据

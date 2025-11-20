@@ -379,11 +379,11 @@ class RecurrentAnatomyGAT(torch.nn.Module):
             torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
         )
         self.geom_encoder = torch.nn.Sequential(
-            torch.nn.Linear(6, 128), torch.nn.ReLU(), LayerNorm(128)
+            torch.nn.Linear(8, 128), torch.nn.ReLU(), LayerNorm(128)
         )
-        # 先验编码器：处理 [N, 50] 的向量
+        # 先验编码器：处理 [N, 50 * 2] 的向量
         self.prior_encoder = torch.nn.Sequential(
-            torch.nn.Linear(n_classes + 1, 128), torch.nn.ReLU(), LayerNorm(128)
+            torch.nn.Linear((n_classes + 1) * 2, 128), torch.nn.ReLU(), LayerNorm(128)
         )
 
         self.fused_dim = 128 * 3  # 384
@@ -423,29 +423,32 @@ class RecurrentAnatomyGAT(torch.nn.Module):
         edge_index_overlap = data.edge_index_overlap.to(device)
         edge_index_arch = data.edge_index_arch.to(device)
         edge_index_spatial = data.edge_index_spatial.to(device)
+        edge_index_vertical = data.edge_index_vertical.to(device)
 
         type_overlap = torch.zeros(edge_index_overlap.size(1), dtype=torch.long, device=device)
         type_arch = torch.ones(edge_index_arch.size(1), dtype=torch.long, device=device)
-        type_spatial = torch.full((edge_index_spatial.size(1),), 2, dtype=torch.long, device=device)
+        type_vertical = torch.full((edge_index_vertical.size(1),),2,dtype=torch.long,device=device)
+        type_spatial = torch.full((edge_index_spatial.size(1),), 3, dtype=torch.long, device=device)
 
-        edge_index = torch.cat([edge_index_overlap, edge_index_arch, edge_index_spatial], dim=1)
-        edge_type = torch.cat([type_overlap, type_arch, type_spatial], dim=0)
+        edge_index = torch.cat([edge_index_overlap, edge_index_arch,edge_index_vertical ,edge_index_spatial], dim=1)
+        edge_type = torch.cat([type_overlap, type_arch, type_vertical,type_spatial], dim=0)
 
         # 2. 编码静态特征 (只做一次)
         h_visual = self.visual_encoder(data.x_visual)
         h_geom = self.geom_encoder(data.x_geom)
-
+        original_prior = data.x_prior.to(device)
         all_step_logits = []
 
         # 3. 初始化动态信念 (Time step 0)
         # 初始信念来自检测器的原始输出
-        current_prior_input = data.x_prior
+        current_dynamic_belief = original_prior.clone()
 
 
         # --- 4. 迭代循环 (Recurrent Loop) ---
         for t in range(self.num_iterations):
             # A. 编码当前信念
-            h_prior = self.prior_encoder(current_prior_input)
+            combined_prior_input = torch.cat([original_prior,current_dynamic_belief],dim=1)
+            h_prior = self.prior_encoder(combined_prior_input)
 
             # B. 融合
             h_0 = torch.cat([h_visual, h_geom, h_prior], dim=-1)  # [N, 384]
@@ -471,6 +474,6 @@ class RecurrentAnatomyGAT(torch.nn.Module):
                 confidence, _ = torch.max(probs, dim=1, keepdim=True)  # [N, 1]
                 # 拼接成新的 x_prior [N, 50]
                 # 这就是"信念传播"：GNN现在的输出变成了下一轮的输入
-                current_prior_input = torch.cat([probs, confidence], dim=1)
+                current_dynamic_belief = torch.cat([probs, confidence], dim=1)
 
         return all_step_logits

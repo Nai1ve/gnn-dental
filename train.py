@@ -54,10 +54,14 @@ def train_epoch(model,loader,criterion,optimizer):
         batch_loss = 0
         y_true = batch.y.long()
 
-        for logits in all_step_logits:
-            batch_loss += criterion(logits,y_true)
+        loss_weights = [1.0,0.5,0.3]
+
+        for i,logits in enumerate(all_step_logits):
+            weight = loss_weights[i] if i < len(loss_weights) else 0.1
+            batch_loss += weight * criterion(logits, y_true)
 
         batch_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += batch_loss.item() * batch.num_graphs
 
