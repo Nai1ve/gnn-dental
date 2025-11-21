@@ -22,23 +22,23 @@ CONFUSION_SET_CLASSES = {
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #data_path = 'data/gnn_train_data_with_visual_embedding_0.3.pt'
 #data_path = 'gnn_data/train.pt'
-data_path = 'gnn_data/train_v2.pt'
+data_path = 'gnn_data/train_v6.pt'
 #val_data_path = 'data/gnn_val_data_with_visual_embedding_0.3.pt'
 #val_data_path = 'gnn_data/val.pt'
-val_data_path = 'gnn_data/val_v2.pt'
+val_data_path = 'gnn_data/val_v6.pt'
 N_CLASSES = 49
 model_save_dir = f'checkpoints/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}/'
 os.makedirs(model_save_dir, exist_ok=True)
 
 # 超参数
 LEARNING_RATE = 1e-5
-BATCH_SIZE = 16 # 可以根据你的显存调整
+BATCH_SIZE = 8 # 可以根据你的显存调整
 EPOCHS = 200
 #HIDDEN_CHANNELS = 128
 #HEADS = 4
 # 1030
 #INPUT_CHANNELS = 1033
-PATIENCE_EPOCHS = 10
+PATIENCE_EPOCHS = 20
 #INPUT_CHANNELS = 55
 #OUTPUT_CHANNELS = 49
 WEIGHT_DECAY = 1e-5
@@ -160,7 +160,7 @@ def main():
     # --- 1. 实例化模型 ---
     #model = BaselineGNN(n_classes=N_CLASSES).to(device)
     #model = AnatomyGAT(n_classes=N_CLASSES,num_relations=3).to(device)
-    model = RecurrentAnatomyGAT(n_classes=N_CLASSES,num_relations=3,num_iterations=3).to(device)
+    model = RecurrentAnatomyGAT(n_classes=N_CLASSES,num_relations=4,num_iterations=3).to(device)
     logging.info(f"模型 {type(model).__name__} 已实例化 (n_classes={N_CLASSES})")
 
     # 打印模型结构 (可选，但有助于调试)

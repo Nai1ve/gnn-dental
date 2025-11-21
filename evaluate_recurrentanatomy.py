@@ -12,11 +12,11 @@ from model import RecurrentAnatomyGAT
 # 1. 核心配置
 # ==============================================================================
 
-MODEL_PATH = 'checkpoints/2025-11-19_22-08-45/best_model.pth'
+MODEL_PATH = 'checkpoints/2025-11-20_20-28-43/best_model.pth'
 
-TEST_DATA_PATH = 'gnn_data/test_v5.pt'  # 请确保这是包含 V4.1+ 结构的新数据
+TEST_DATA_PATH = 'gnn_data/test_ccsw.pt'  # 请确保这是包含 V4.1+ 结构的新数据
 N_CLASSES = 49
-NUM_RELATIONS = 3
+NUM_RELATIONS = 4
 NUM_ITERATIONS = 3  # [!! 新增 !!] 必须与训练时设置的迭代次数一致
 BATCH_SIZE = 16
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -228,7 +228,7 @@ def main():
     )
 
     # --- 7. 生成逐图预测文件 ---
-    save_pt_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions_recurrent.pt')
+    save_pt_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions_recurrent_ccsw_final.pt')
     generate_per_graph_predictions(model, test_data_list, DEVICE, N_CLASSES, save_pt_path)
 
     logging.info("迭代模型评估结束。")

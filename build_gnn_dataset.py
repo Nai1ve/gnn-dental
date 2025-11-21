@@ -35,6 +35,7 @@ IOU_THRESHOLD = 0.5
 # 1. 核心构图算法 (V4.1: 解耦 + 各向异性)
 # ==============================================================================
 def build_multi_relation_graph(boxes, node_centers,
+                               scores,
                                iou_threshold=0.4,
                                ios_threshold=0.8,
                                k_arch=2,
@@ -74,12 +75,17 @@ def build_multi_relation_graph(boxes, node_centers,
     # =========================================================
 
     # 逻辑: IoU > 阈值 OR IoS > 阈值
-    mask_overlap = (iou_matrix > iou_threshold) | (ios_matrix > ios_threshold)
-    mask_overlap.fill_diagonal_(False)
-    edge_index_overlap = mask_overlap.nonzero(as_tuple=False).t().contiguous()
+    is_overlapping = (iou_matrix > iou_threshold) | (ios_matrix > ios_threshold)
+
+    # 添加方向逻辑，高Score抑制低Score
+    is_score_higher = (scores.unsqueeze(1) > scores.unsqueeze(0))
+
+    mask_overlap_directed = is_overlapping & is_score_higher
+
+    edge_index_overlap = mask_overlap_directed.nonzero(as_tuple=False).t().contiguous()
 
     # 定义通用禁止掩码 (重叠的和自己的，都不能是解剖邻居)
-    mask_forbidden_base = mask_overlap | torch.eye(N, dtype=torch.bool, device=device)
+    mask_forbidden_base = is_overlapping | torch.eye(N, dtype=torch.bool, device=device)
 
     # =========================================================
     # C. 构建 edge_index_arch (Type 1: 牙弓/横向边)
@@ -329,6 +335,7 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
     edge_overlap, edge_arch, e_vert,edge_spatial = build_multi_relation_graph(
         boxes=final_bboxes_tensor,  # xyxy
         node_centers=pos,  # cx, cy
+        scores=final_scores_tensor,
         iou_threshold=iou_threshold_graph,
         ios_threshold=ios_threshold_graph,
         k_arch=4,  # 牙弓找左右邻居

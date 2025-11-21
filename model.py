@@ -362,7 +362,7 @@ class AnatomyGAT(torch.nn.Module):
 
 
 class RecurrentAnatomyGAT(torch.nn.Module):
-    def __init__(self, n_classes, num_relations=3, num_iterations=3):
+    def __init__(self, n_classes, num_relations=4, num_iterations=3):
         """
         RecurrentAnatomyGAT: 迭代式解剖学感知图神经网络
 
