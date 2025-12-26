@@ -31,6 +31,24 @@ epsilon = 1e-6
 IOU_THRESHOLD = 0.5
 
 
+def fourier_encode(x, num_bands=4):
+    """
+    x: [N] 或 [N, 1] 的坐标张量
+    num_bands: 频率带数量
+    返回: [N, num_bands * 2]
+    """
+    x = x.unsqueeze(-1)  # [N, 1]
+    device = x.device
+    # 创建频率: [2^0, 2^1, ..., 2^(L-1)]
+    freqs = torch.pow(2, torch.arange(num_bands, dtype=torch.float, device=device))
+
+    # [N, num_bands]
+    x_freq = x * freqs * torch.pi
+
+    # 拼接 sin 和 cos -> [N, num_bands * 2]
+    return torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1)
+
+
 # ==============================================================================
 # 1. 核心构图算法 (V4.1: 解耦 + 各向异性)
 # ==============================================================================
@@ -228,8 +246,8 @@ def generate_gnn_y_labels_local(pred_bboxes_np, pred_scores_np,
 # 3. 主图构建函数 (已更新为使用 build_multi_relation_graph)
 # ==============================================================================
 def build_graph_from_features(raw_data: dict, gt_data: dict,
-                              k_neighbors: int, min_score_threshold: int,
-                              iou_threshold_graph: float, y_penalty: float,ios_threshold_graph:float) -> Optional[Data]:
+                              k_neighbors: int, min_score_threshold: float,
+                              iou_threshold_graph: float, y_penalty: float,ios_threshold_graph:float,k_arch:int) -> Optional[Data]:
     """
     从原始特征构建单个 AnatomyGAT Data对象。
     """
@@ -282,6 +300,19 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
     # 计算重心
     centroid = torch.mean(pos_abs, dim=0)  # [mean_x, mean_y]
 
+    # [新增特征] 重心相对坐标 (2维) -> 总共 8维
+    norm_dx = (centers_x - centroid[0]) / img_w
+    norm_dy = (centers_y - centroid[1]) / img_h
+
+    # [向量化傅里叶编码]
+    # 输入 [N], 输出 [N, 8] (2D Tensor)
+    enc_dx = fourier_encode(norm_dx, num_bands=4)
+    enc_dy = fourier_encode(norm_dy, num_bands=4)
+
+    # 拼接相对坐标特征 [N, 16]
+    # 这里的 rel_coord_all 是 2D 的 [N, 16]
+    rel_coord_all = torch.cat([enc_dx, enc_dy], dim=1)
+
     for i in range(num_preds):
         bbox = final_bboxes_tensor[i]  # xyxy
         w = bbox[2] - bbox[0]
@@ -297,22 +328,17 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         confidence_score = final_scores_tensor[i].unsqueeze(0) * 2 - 1
         pred_all_class_prob = final_pred_all_class_probs[i]
 
-        # [新增特征] 重心相对坐标 (2维) -> 总共 8维
-        delta_x = x_center - centroid[0]
-        delta_y = y_center - centroid[1]
-        rel_coord = torch.tensor([
-            (delta_x / img_w) * 2,  # 归一化
-            (delta_y / img_h) * 2
-        ])
+
 
 
         # 几何特征 (8维: cx, cy, w, h, area, ratio,x重心，y重心)
-        x_g = torch.cat([
+        base_geom = torch.cat([
             geom_shape_features,  # 4D
             area_feature,  # 1D
             aspect_ratio_features,  # 1D
-            rel_coord# 2D
         ])
+        x_g = torch.cat([base_geom, rel_coord_all[i]])  # 结果是 [22]
+
         feature_list_graph.append(x_g)
 
         # 先验特征 (50维: 49 class probs + 1 score)
@@ -338,7 +364,7 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         scores=final_scores_tensor,
         iou_threshold=iou_threshold_graph,
         ios_threshold=ios_threshold_graph,
-        k_arch=4,  # 牙弓找左右邻居
+        k_arch=k_arch,  # 牙弓找左右邻居
         k_spatial=k_neighbors,  # 空间找 k 个
         y_penalty=y_penalty,  # 垂直惩罚
         k_vertical=1,#替换牙数量
@@ -395,6 +421,7 @@ def main():
     parser.add_argument('--iou-threshold', type=float, default=0.4, help="重叠边的 IoU 阈值")
     parser.add_argument('--ios-threshold', type=float, default=0.8, help="重叠边的 IoU 阈值")
     parser.add_argument('--y-penalty', type=float, default=3.0, help="牙弓边的垂直距离惩罚系数")
+    parser.add_argument('--k-arch', type=int, default=4, help="牙弓边的垂直距离惩罚系数")
     parser.add_argument('-confidence', type=float, default=0.3, help='节点置信度过滤阈值')
 
     args = parser.parse_args()
@@ -402,7 +429,7 @@ def main():
     # 1. 加载原始特征
     print(f"正在加载原始特征: {args.input_features}")
     try:
-        raw_data_list = torch.load(args.input_features, map_location='cpu')
+        raw_data_list = torch.load(args.input_features)
     except Exception as e:
         print(f"加载失败: {e}");
         return
@@ -455,19 +482,23 @@ def main():
                 min_score_threshold=args.confidence,
                 iou_threshold_graph=args.iou_threshold,
                 y_penalty=args.y_penalty,
-                ios_threshold_graph=args.ios_threshold
+                ios_threshold_graph=args.ios_threshold,
+                k_arch=args.k_arch
             )
             if gnn_data is not None:
                 final_gnn_list.append(gnn_data)
         except Exception as e:
             print(f"错误 (img_id {img_id}): {e}")
-            # import traceback; traceback.print_exc()
+            import traceback; traceback.print_exc()
+
+
 
     # 4. 保存
     print(f"完成。生成 {len(final_gnn_list)} 个图。")
     os.makedirs(os.path.dirname(args.output_pt), exist_ok=True)
     torch.save(final_gnn_list, args.output_pt)
     print(f"保存至: {args.output_pt}")
+
 
 
 if __name__ == '__main__':
