@@ -1,7 +1,7 @@
 import torch
 
 from torch_geometric.nn import GATv2Conv, LayerNorm,TransformerConv,global_mean_pool,RGATConv
-from torch.nn import Linear,Sequential,ReLU,ELU,Dropout
+from torch.nn import Linear,Sequential,ELU,Dropout
 from torch_geometric.data import Data
 import torch.nn.functional as F
 
@@ -365,40 +365,33 @@ class RecurrentAnatomyGAT(torch.nn.Module):
     def __init__(self, n_classes, num_relations=4, num_iterations=3):
         """
         RecurrentAnatomyGAT: 迭代式解剖学感知图神经网络
-
-        参数:
-            num_iterations: 迭代推理的次数 (建议 2 或 3)
         """
         super(RecurrentAnatomyGAT, self).__init__()
 
         self.n_classes = n_classes
         self.num_iterations = num_iterations
 
-        # --- 1. 编码器 (权重共享) ---
+        # --- 1. 编码器 ---
         self.visual_encoder = torch.nn.Sequential(
             torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
         )
         self.geom_encoder = torch.nn.Sequential(
-            torch.nn.Linear(8, 128), torch.nn.ReLU(), LayerNorm(128)
+            torch.nn.Linear(22, 128), torch.nn.ReLU(), LayerNorm(128)
         )
-        # 先验编码器：处理 [N, 50 * 2] 的向量
         self.prior_encoder = torch.nn.Sequential(
             torch.nn.Linear((n_classes + 1) * 2, 128), torch.nn.ReLU(), LayerNorm(128)
         )
 
         self.fused_dim = 128 * 3  # 384
 
-        # --- 2. 关系 GAT 核心 (权重共享) ---
-        # 在所有迭代步中，我们使用同一套 GNN 权重
-        # 这迫使模型学习通用的"修正逻辑"，而不是死记硬背
-
+        # --- 2. 关系 GAT 核心 ---
         self.rgat_layer_1 = RGATConv(
             in_channels=self.fused_dim,
             out_channels=48,
             num_relations=num_relations,
             heads=8, concat=True, dropout=0.2
         )
-        self.norm_1 = LayerNorm(self.fused_dim)
+        self.norm_1 = LayerNorm(self.fused_dim)  # 48*8 = 384
 
         self.rgat_layer_2 = RGATConv(
             in_channels=self.fused_dim,
@@ -408,7 +401,7 @@ class RecurrentAnatomyGAT(torch.nn.Module):
         )
         self.norm_2 = LayerNorm(self.fused_dim)
 
-        # --- 3. 分类器 (权重共享) ---
+        # --- 3. 分类器 ---
         self.classifier = torch.nn.Sequential(
             torch.nn.Linear(self.fused_dim, 128),
             torch.nn.ReLU(),
@@ -416,10 +409,15 @@ class RecurrentAnatomyGAT(torch.nn.Module):
             torch.nn.Linear(128, n_classes)
         )
 
-    def forward(self, data):
+    def forward(self, data, return_att=False):
+        """
+        参数:
+            data: 图数据对象
+            return_att (bool): 是否返回注意力权重 (仅在可视化时设为 True)
+        """
         device = data.x_visual.device
 
-        # 1. 准备边信息 (只做一次)
+        # 1. 准备边信息
         edge_index_overlap = data.edge_index_overlap.to(device)
         edge_index_arch = data.edge_index_arch.to(device)
         edge_index_spatial = data.edge_index_spatial.to(device)
@@ -427,20 +425,29 @@ class RecurrentAnatomyGAT(torch.nn.Module):
 
         type_overlap = torch.zeros(edge_index_overlap.size(1), dtype=torch.long, device=device)
         type_arch = torch.ones(edge_index_arch.size(1), dtype=torch.long, device=device)
-        type_vertical = torch.full((edge_index_vertical.size(1),),2,dtype=torch.long,device=device)
+        type_vertical = torch.full((edge_index_vertical.size(1),), 2, dtype=torch.long, device=device)
         type_spatial = torch.full((edge_index_spatial.size(1),), 3, dtype=torch.long, device=device)
 
-        edge_index = torch.cat([edge_index_overlap, edge_index_arch,edge_index_vertical ,edge_index_spatial], dim=1)
-        edge_type = torch.cat([type_overlap, type_arch, type_vertical,type_spatial], dim=0)
+        # 拼接所有边
+        edge_index = torch.cat([edge_index_overlap, edge_index_arch, edge_index_vertical, edge_index_spatial], dim=1)
+        edge_type = torch.cat([type_overlap, type_arch, type_vertical, type_spatial], dim=0)
 
-        # 2. 编码静态特征 (只做一次)
+        # 2. 编码静态特征 (保留你的消融实验设置)
         h_visual = self.visual_encoder(data.x_visual)
         h_geom = self.geom_encoder(data.x_geom)
+
+        # --- 你的消融设置 (根据需要保留或注释) ---
+        # h_geom = torch.zeros_like(h_geom)
+        h_visual = torch.zeros_like(h_visual)
+        # -------------------------------------
+
         original_prior = data.x_prior.to(device)
         all_step_logits = []
 
-        # 3. 初始化动态信念 (Time step 0)
-        # 初始信念来自检测器的原始输出
+        # 用于存储最后一次迭代的注意力权重
+        final_attention_weights = None
+
+        # 3. 初始化动态信念
         current_dynamic_belief = original_prior.clone()
 
 
@@ -458,7 +465,23 @@ class RecurrentAnatomyGAT(torch.nn.Module):
             h_1 = F.elu(h_1) + h_0
             h_1 = self.norm_1(h_1, data.batch)
 
-            h_2 = self.rgat_layer_2(h_1, edge_index, edge_type)
+            # D. RGAT Layer 2 (我们要提取这里的权重！)
+            # 判断是否是最后一次迭代 且 需要返回权重
+            is_last_iter = (t == self.num_iterations - 1)
+
+            if return_att and is_last_iter:
+                # 开启 return_attention_weights=True
+                h_2, (att_edge_index, alpha) = self.rgat_layer_2(
+                    h_1, edge_index, edge_type, return_attention_weights=True
+                )
+
+                # alpha 的形状是 [Num_Edges, Num_Heads] (例如 [E, 8])
+                # 我们对多头取平均，得到每条边的综合权重
+                final_attention_weights = alpha.mean(dim=1)
+            else:
+                # 正常前向传播
+                h_2 = self.rgat_layer_2(h_1, edge_index, edge_type)
+
             h_2 = F.elu(h_2) + h_1
             h_2 = self.norm_2(h_2, data.batch)
 
@@ -476,4 +499,338 @@ class RecurrentAnatomyGAT(torch.nn.Module):
                 # 这就是"信念传播"：GNN现在的输出变成了下一轮的输入
                 current_dynamic_belief = torch.cat([probs, confidence], dim=1)
 
+        # 5. 返回结果
+        if return_att:
+            # 返回: (所有步的logits, 最后一步的边权重, 最后一步的边索引)
+            return all_step_logits, final_attention_weights, edge_index, edge_type
+
         return all_step_logits
+
+
+class RecurrentAnatomyGATNew(torch.nn.Module):
+    def __init__(self, n_classes, num_relations=4, num_iterations=3,
+                 use_visual=True, use_geom=True):  # 新增消融控制开关
+        """
+        RecurrentAnatomyGAT: 具备动态边缘特征感知的迭代式神经符号图网络
+        """
+        super(RecurrentAnatomyGATNew, self).__init__()
+
+        self.n_classes = n_classes
+        self.num_iterations = num_iterations
+
+        # 消融实验开关，告别 Hardcode
+        self.use_visual = use_visual
+        self.use_geom = use_geom
+
+        # --- 1. 节点特征编码器 ---
+        self.visual_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.geom_encoder = torch.nn.Sequential(
+            torch.nn.Linear(22, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.prior_encoder = torch.nn.Sequential(
+            torch.nn.Linear((n_classes + 1) * 2, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+
+        self.fused_dim = 128 * 3  # 节点融合特征维度: 384
+
+        # --- 2. [核心新增] 边缘特征编码器 (Edge Encoder) ---
+        # 重叠边是 6维 (带IoU), 其他边是 5维。我们统一填充到 6维 后送入编码器
+        self.edge_dim = 64
+        self.edge_encoder = torch.nn.Sequential(
+            torch.nn.Linear(6, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, self.edge_dim),
+            LayerNorm(self.edge_dim)
+        )
+
+        # --- 3. 关系 GAT 核心 (引入 edge_dim 赋能动态注意力) ---
+        self.rgat_layer_1 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8, concat=True, dropout=0.2,
+            edge_dim=self.edge_dim  # <--- [关键补丁] 让注意力机制看到边特征
+        )
+        self.norm_1 = LayerNorm(self.fused_dim)  # 48*8 = 384
+
+        self.rgat_layer_2 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8, concat=True, dropout=0.2,
+            edge_dim=self.edge_dim  # <--- [关键补丁]
+        )
+        self.norm_2 = LayerNorm(self.fused_dim)
+
+        # --- 4. 分类器 ---
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(128, n_classes)
+        )
+
+    def forward(self, data, return_att=False):
+        device = data.x_visual.device
+
+        # ==========================================
+        # 1. 拼接边索引 (Edge Index) 与 边类型 (Edge Type)
+        # ==========================================
+        edge_idx_list = [
+            data.edge_index_overlap, data.edge_index_arch,
+            data.edge_index_vertical, data.edge_index_spatial
+        ]
+        edge_index = torch.cat([e.to(device) for e in edge_idx_list], dim=1)
+
+        type_overlap = torch.zeros(data.edge_index_overlap.size(1), dtype=torch.long, device=device)
+        type_arch = torch.ones(data.edge_index_arch.size(1), dtype=torch.long, device=device)
+        type_vertical = torch.full((data.edge_index_vertical.size(1),), 2, dtype=torch.long, device=device)
+        type_spatial = torch.full((data.edge_index_spatial.size(1),), 3, dtype=torch.long, device=device)
+        edge_type = torch.cat([type_overlap, type_arch, type_vertical, type_spatial], dim=0)
+
+        # ==========================================
+        # 2. [核心新增] 提取并对齐边缘特征 (Edge Attributes)
+        # ==========================================
+        # overlap 自带 IoU (6维)，其他关系缺乏 IoU (5维)，用 0 补齐第 6 维
+        attr_overlap = data.edge_attr_overlap.to(device)
+        attr_arch = F.pad(data.edge_attr_arch.to(device), (0, 1), value=0.0)
+        attr_vert = F.pad(data.edge_attr_vertical.to(device), (0, 1), value=0.0)
+        attr_spat = F.pad(data.edge_attr_spatial.to(device), (0, 1), value=0.0)
+
+        raw_edge_attr = torch.cat([attr_overlap, attr_arch, attr_vert, attr_spat], dim=0)
+
+        # 将原始几何属性映射为高维隐藏特征，供注意力机制使用
+        encoded_edge_attr = self.edge_encoder(raw_edge_attr)
+
+        # ==========================================
+        # 3. 编码静态节点特征 (加入消融控制)
+        # ==========================================
+        h_visual = self.visual_encoder(data.x_visual)
+        if not self.use_visual:
+            h_visual = torch.zeros_like(h_visual)
+
+        h_geom = self.geom_encoder(data.x_geom)
+        if not self.use_geom:
+            h_geom = torch.zeros_like(h_geom)
+
+        original_prior = data.x_prior.to(device)
+        all_step_logits = []
+        final_attention_weights = None
+        current_dynamic_belief = original_prior.clone()
+
+        # ==========================================
+        # 4. 迭代循环 (Working Memory Reasoning)
+        # ==========================================
+        for t in range(self.num_iterations):
+            # A. 编码并融合当前信念 (Working Memory)
+            combined_prior_input = torch.cat([original_prior, current_dynamic_belief], dim=1)
+            h_prior = self.prior_encoder(combined_prior_input)
+            h_0 = torch.cat([h_visual, h_geom, h_prior], dim=-1)  # [N, 384]
+
+            # B. 关系感知与边缘特征注入的消息传递
+            # 现在，RGAT 能够结合节点的视觉特征和它们之间的相对几何关系来决定权重
+            h_1 = self.rgat_layer_1(h_0, edge_index, edge_type, edge_attr=encoded_edge_attr)
+            h_1 = F.elu(h_1) + h_0
+            h_1 = self.norm_1(h_1, data.batch)
+
+            is_last_iter = (t == self.num_iterations - 1)
+
+            # C. 第二层消息传递 (提取最终 Attention Map 供论文可视化)
+            if return_att and is_last_iter:
+                h_2, (att_edge_index, alpha) = self.rgat_layer_2(
+                    h_1, edge_index, edge_type, edge_attr=encoded_edge_attr, return_attention_weights=True
+                )
+                final_attention_weights = alpha.mean(dim=1)
+            else:
+                h_2 = self.rgat_layer_2(h_1, edge_index, edge_type, edge_attr=encoded_edge_attr)
+
+            h_2 = F.elu(h_2) + h_1
+            h_2 = self.norm_2(h_2, data.batch)
+
+            # D. 输出解码
+            logits = self.classifier(h_2)
+            all_step_logits.append(logits)
+
+            # E. 动态信念更新 (State Evolution)
+            if t < self.num_iterations - 1:
+                probs = F.softmax(logits, dim=1)
+                confidence, _ = torch.max(probs, dim=1, keepdim=True)
+                current_dynamic_belief = torch.cat([probs, confidence], dim=1)
+
+        if return_att:
+            return all_step_logits, final_attention_weights, edge_index, edge_type
+
+        return all_step_logits
+
+
+class RecurrentAnatomyGATNew_A(torch.nn.Module):
+    def __init__(self, n_classes, num_relations=4, num_iterations=3,
+                 use_visual=True, use_geom=True, use_prior=True,
+                 use_edge_features=True, spatial_only=False):  # [核心新增] spatial_only 开关
+        """
+        RecurrentAnatomyGAT: 具备动态边缘特征感知的迭代式神经符号图网络
+        """
+        super(RecurrentAnatomyGATNew_A, self).__init__()
+
+        self.n_classes = n_classes
+        self.num_iterations = num_iterations
+
+        # 消融实验开关，告别 Hardcode
+        self.use_visual = use_visual
+        self.use_geom = use_geom
+        self.use_prior = use_prior
+        self.use_edge_features = use_edge_features
+        self.spatial_only = spatial_only  # 是否退化为 Basic GAT
+
+        # --- 1. 节点特征编码器 ---
+        self.visual_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.geom_encoder = torch.nn.Sequential(
+            torch.nn.Linear(22, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.prior_encoder = torch.nn.Sequential(
+            torch.nn.Linear((n_classes + 1) * 2, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+
+        self.fused_dim = 128 * 3  # 节点融合特征维度: 384
+
+        # --- 2. 边缘特征编码器 (Edge Encoder) ---
+        self.edge_dim = 64
+        self.edge_encoder = torch.nn.Sequential(
+            torch.nn.Linear(6, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, self.edge_dim),
+            LayerNorm(self.edge_dim)
+        )
+
+        # --- 3. 关系 GAT 核心 ---
+        self.rgat_layer_1 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8, concat=True, dropout=0.2,
+            edge_dim=self.edge_dim
+        )
+        self.norm_1 = LayerNorm(self.fused_dim)  # 48*8 = 384
+
+        self.rgat_layer_2 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8, concat=True, dropout=0.2,
+            edge_dim=self.edge_dim
+        )
+        self.norm_2 = LayerNorm(self.fused_dim)
+
+        # --- 4. 分类器 ---
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(128, n_classes)
+        )
+
+    def forward(self, data, return_att=False):
+        device = data.x_visual.device
+
+        # ==========================================
+        # 1. 拼接边索引 (Edge Index) 与 边类型 (Edge Type)
+        # ==========================================
+        edge_idx_list = [
+            data.edge_index_overlap, data.edge_index_arch,
+            data.edge_index_vertical, data.edge_index_spatial
+        ]
+        edge_index = torch.cat([e.to(device) for e in edge_idx_list], dim=1)
+
+        type_overlap = torch.zeros(data.edge_index_overlap.size(1), dtype=torch.long, device=device)
+        type_arch = torch.ones(data.edge_index_arch.size(1), dtype=torch.long, device=device)
+        type_vertical = torch.full((data.edge_index_vertical.size(1),), 2, dtype=torch.long, device=device)
+        type_spatial = torch.full((data.edge_index_spatial.size(1),), 3, dtype=torch.long, device=device)
+        edge_type = torch.cat([type_overlap, type_arch, type_vertical, type_spatial], dim=0)
+
+        # ==========================================
+        # 2. 提取原始边缘特征 (Edge Attributes)
+        # ==========================================
+        attr_overlap = data.edge_attr_overlap.to(device)
+        attr_arch = F.pad(data.edge_attr_arch.to(device), (0, 1), value=0.0)
+        attr_vert = F.pad(data.edge_attr_vertical.to(device), (0, 1), value=0.0)
+        attr_spat = F.pad(data.edge_attr_spatial.to(device), (0, 1), value=0.0)
+
+        raw_edge_attr = torch.cat([attr_overlap, attr_arch, attr_vert, attr_spat], dim=0)
+
+        # ==========================================
+        # [核心消融拦截区]：Basic GAT 与 Edge 消融控制
+        # ==========================================
+        if self.spatial_only:
+            # A. Basic GAT 退化：只保留空间边 (type == 3)
+            mask = (edge_type == 3)
+            edge_index = edge_index[:, mask]
+            raw_edge_attr = raw_edge_attr[mask]
+            # 抹平 edge_type，所有边变为 type 0，让 RGAT 退化为普通的单关系 GAT
+            edge_type = torch.zeros_like(edge_type[mask])
+
+        # B. 边缘特征编码
+        encoded_edge_attr = self.edge_encoder(raw_edge_attr)
+
+        if not self.use_edge_features:
+            # C. 边缘特征消融：用全 0 覆盖，模型只能看到连接结构，看不到物理属性
+            encoded_edge_attr = torch.zeros_like(encoded_edge_attr)
+
+        # ==========================================
+        # 3. 编码静态节点特征 (加入消融控制)
+        # ==========================================
+        h_visual = self.visual_encoder(data.x_visual)
+        if not self.use_visual:
+            h_visual = torch.zeros_like(h_visual)
+
+        h_geom = self.geom_encoder(data.x_geom)
+        if not self.use_geom:
+            h_geom = torch.zeros_like(h_geom)
+
+        original_prior = data.x_prior.to(device)
+        if not self.use_prior:
+            original_prior = torch.zeros_like(original_prior)
+
+        all_step_logits = []
+        final_attention_weights = None
+        current_dynamic_belief = original_prior.clone()
+
+        # ==========================================
+        # 4. 迭代循环 (Working Memory Reasoning)
+        # ==========================================
+        for t in range(self.num_iterations):
+            # A. 编码并融合当前信念
+            combined_prior_input = torch.cat([original_prior, current_dynamic_belief], dim=1)
+            h_prior = self.prior_encoder(combined_prior_input)
+            h_0 = torch.cat([h_visual, h_geom, h_prior], dim=-1)  # [N, 384]
+
+            # B. 关系感知与边缘特征注入的消息传递
+            h_1 = self.rgat_layer_1(h_0, edge_index, edge_type, edge_attr=encoded_edge_attr)
+            h_1 = F.elu(h_1) + h_0
+            h_1 = self.norm_1(h_1)
+
+            is_last_iter = (t == self.num_iterations - 1)
+
+            # C. 第二层消息传递 (提取最终 Attention Map)
+            h_2, (att_edge_index, alpha) = self.rgat_layer_2(
+                h_1, edge_index, edge_type, edge_attr=encoded_edge_attr, return_attention_weights=True
+            )
+            final_attention_weights = alpha.mean(dim=1)
+
+            h_2 = F.elu(h_2) + h_1
+            h_2 = self.norm_2(h_2)
+
+            # D. 输出解码
+            logits = self.classifier(h_2)
+            all_step_logits.append(logits)
+
+            # E. 动态信念更新
+            if t < self.num_iterations - 1:
+                probs = F.softmax(logits, dim=1)
+                confidence, _ = torch.max(probs, dim=1, keepdim=True)
+                current_dynamic_belief = torch.cat([probs, confidence], dim=1)
+
+        return all_step_logits, final_attention_weights, edge_index, edge_type

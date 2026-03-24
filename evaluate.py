@@ -271,7 +271,7 @@ def main():
     logging.info("\n--- 正在调用函数以保存逐图(per-graph)预测文件... ---")
 
     # 定义您想保存的文件路径
-    per_graph_save_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions.pt')
+    per_graph_save_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions_baseline.pt')
 
     # 调用我们新添加的函数
     # 它需要: model, test_data_list (不是loader!), device, n_classes, save_path

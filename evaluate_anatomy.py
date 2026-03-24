@@ -224,7 +224,7 @@ def main():
     )
 
     # --- 7. [关键] 生成逐图预测文件 ---
-    save_pt_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions.pt')
+    save_pt_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions_baseline.pt')
     generate_per_graph_predictions(model, test_data_list, DEVICE, N_CLASSES, save_pt_path)
 
     logging.info("评估流程结束。")

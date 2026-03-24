@@ -3,39 +3,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-
 class FocalLoss(nn.Module):
     """
-    多分类场景下的Focal Loss实现
+    引入非对称机制 (Asymmetric) 的多分类 Focal Loss
+    专门用于缓解苛刻拓扑约束下的 FN (漏检) 升高问题
     """
 
-    def __init__(self,alpha=None,gamma=2.0,reduction='mean'):
-        super(FocalLoss,self).__init__()
-        self.gamma = gamma
+    def __init__(self, alpha=None, gamma_pos=1.0, gamma_neg=3.0, bg_idx=48, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        # 针对牙齿前景：赋予较小 gamma，迫使网络绝不放弃，严惩 FN
+        self.gamma_pos = gamma_pos
+        # 针对背景：赋予较大 gamma，让网络彻底忽略容易区分的背景
+        self.gamma_neg = gamma_neg
+        self.bg_idx = bg_idx
         self.alpha = alpha
         self.reduction = reduction
 
-
-    def forward(self,input,targets):
-        ce_loss = F.cross_entropy(input,targets,reduction='none')
+    def forward(self, input, targets):
+        # 1. 计算基础的交叉熵和概率 pt
+        ce_loss = F.cross_entropy(input, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = (1-pt) ** self.gamma * ce_loss
 
+        # 2. [核心修改] 动态生成非对称 gamma 张量
+        # 先默认全部赋予背景的 gamma_neg，注意类型与 ce_loss 对齐 (Float)
+        gamma_t = torch.full_like(ce_loss, self.gamma_neg)
+        # 将属于真实牙齿的前景目标的 gamma 替换为严厉的 gamma_pos
+        gamma_t[targets != self.bg_idx] = self.gamma_pos
+
+        # 3. 应用非对称衰减
+        focal_loss = ((1 - pt) ** gamma_t) * ce_loss
+
+        # 4. 保持你原有的 Alpha 类别权重逻辑
         if self.alpha is not None:
-            if isinstance(self.alpha,float):
-                alpha_t = torch.full_like(targets,1-self.alpha)
-                alpha_t[targets !=0] = self.alpha
+            if isinstance(self.alpha, float):
+                alpha_t = torch.full_like(targets, 1 - self.alpha, dtype=torch.float)
+                alpha_t[targets != 0] = self.alpha
             else:
                 alpha_t = self.alpha[targets]
             focal_loss = alpha_t * focal_loss
 
+        # 5. 返回结果
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
         else:
             return focal_loss
-
 
 
 if __name__ == '__main__':

@@ -1,14 +1,9 @@
 from typing import Optional
 import torch
 import numpy as np
-import pickle
-import json
 from pycocotools.coco import COCO
 from torch_geometric.data import Data
-# from torch_geometric.transforms import KNNGraph #不再需要
-# from torch_geometric.utils import to_undirected #不再需要
 import torch.nn.functional as F
-from collections import defaultdict
 from tqdm import tqdm
 import os
 import math
@@ -39,13 +34,8 @@ def fourier_encode(x, num_bands=4):
     """
     x = x.unsqueeze(-1)  # [N, 1]
     device = x.device
-    # 创建频率: [2^0, 2^1, ..., 2^(L-1)]
     freqs = torch.pow(2, torch.arange(num_bands, dtype=torch.float, device=device))
-
-    # [N, num_bands]
     x_freq = x * freqs * torch.pi
-
-    # 拼接 sin 和 cos -> [N, num_bands * 2]
     return torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1)
 
 
@@ -59,8 +49,8 @@ def build_multi_relation_graph(boxes, node_centers,
                                k_arch=2,
                                k_spatial=9,
                                y_penalty=3.0,
-                               k_vertical=1,  # [新增参数] 纵向视野
-                               x_penalty=5.0):  # [新增参数] X轴惩罚系数
+                               k_vertical=1,
+                               x_penalty=5.0):
     """
     构建四种解耦的边关系 (V5.1)。
     """
@@ -69,17 +59,10 @@ def build_multi_relation_graph(boxes, node_centers,
 
     if N < 2:
         empty_edge = torch.empty((2, 0), dtype=torch.long, device=device)
-        # 返回4个空边
         return empty_edge, empty_edge, empty_edge, empty_edge
 
-    # =========================================================
-    # A. 基础矩阵计算
-    # =========================================================
-
-    # 1. IoU 矩阵
+    # 1. IoU & IoS 矩阵
     iou_matrix = torchvision.ops.box_iou(boxes, boxes)
-
-    # 2. IoS (Intersection over Smaller) 矩阵 - 用于解决大牙套小框
     area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     lt = torch.max(boxes[:, None, :2], boxes[:, :2])
     rb = torch.min(boxes[:, None, 2:], boxes[:, 2:])
@@ -88,43 +71,28 @@ def build_multi_relation_graph(boxes, node_centers,
     min_area = torch.min(area[:, None], area[None, :])
     ios_matrix = inter / (min_area + 1e-6)
 
-    # =========================================================
-    # B. 构建 edge_index_overlap (Type 0: 重叠/抑制边)
-    # =========================================================
-
-    # 逻辑: IoU > 阈值 OR IoS > 阈值
+    # 2. edge_index_overlap
     is_overlapping = (iou_matrix > iou_threshold) | (ios_matrix > ios_threshold)
+    is_overlapping.fill_diagonal_(False)
 
-    # 添加方向逻辑，高Score抑制低Score
-    is_score_higher = (scores.unsqueeze(1) > scores.unsqueeze(0))
+    # [核心修改]: 彻底废弃 is_score_higher = (scores.unsqueeze(1) > scores.unsqueeze(0))
+    # 允许低分候选框通过图推理“反杀”高分的错误框/伪影框。
+    # 构建双向重叠边，让下游的 RGAT 根据视觉特征和几何特征(边属性)动态计算抑制权重。
+    edge_index_overlap = is_overlapping.nonzero(as_tuple=False).t().contiguous()
 
-    mask_overlap_directed = is_overlapping & is_score_higher
-
-    edge_index_overlap = mask_overlap_directed.nonzero(as_tuple=False).t().contiguous()
-
-    # 定义通用禁止掩码 (重叠的和自己的，都不能是解剖邻居)
+    # mask_forbidden_base 依然需要保留，用于防止在牙弓/垂直关系中建立重叠节点的连线
     mask_forbidden_base = is_overlapping | torch.eye(N, dtype=torch.bool, device=device)
 
-    # =========================================================
-    # C. 构建 edge_index_arch (Type 1: 牙弓/横向边)
-    # =========================================================
-
-    # 1. 各向异性坐标变换 (拉伸Y轴，惩罚垂直距离，强制看左右)
+    # 3. edge_index_arch
     scaled_centers_arch = node_centers.clone()
     scaled_centers_arch[:, 1] *= y_penalty
-
-    # 2. 计算距离矩阵
     arch_dist_matrix = torch.cdist(scaled_centers_arch, scaled_centers_arch, p=2)
-
-    # 3. 应用约束 (禁止重叠和自循环)
     arch_dist_matrix[mask_forbidden_base] = float('inf')
 
-    # 4. 执行 k-NN
     curr_k_arch = min(k_arch, N - 1)
     if curr_k_arch > 0:
         dists, indices = torch.topk(arch_dist_matrix, k=curr_k_arch, dim=1, largest=False)
         valid_mask = (dists != float('inf'))
-
         source_nodes = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k_arch)
         valid_sources = source_nodes[valid_mask]
         valid_targets = indices[valid_mask]
@@ -133,38 +101,24 @@ def build_multi_relation_graph(boxes, node_centers,
     else:
         edge_index_arch = torch.empty((2, 0), dtype=torch.long, device=device)
 
-    # =========================================================
-    # D. 构建 edge_index_vertical (Type 2: 替换牙/纵向边) [新增部分]
-    # =========================================================
-
-    # 1. 各向异性坐标变换 (拉伸X轴，惩罚水平距离，强制看上下)
+    # 4. edge_index_vertical
     scaled_centers_vert = node_centers.clone()
     scaled_centers_vert[:, 0] *= x_penalty
-
-    # 2. 计算距离矩阵
     vert_dist_matrix = torch.cdist(scaled_centers_vert, scaled_centers_vert, p=2)
 
-    # 3. 应用约束
-    # [关键] 禁止跨颌连接 (Anti-Opposing Constraint)
-    # 我们只找"同侧牙弓"内的垂直关系 (恒牙胚 <-> 乳牙)
     y_midline = torch.median(node_centers[:, 1])
     is_upper = (node_centers[:, 1] < y_midline)
     is_lower = (node_centers[:, 1] >= y_midline)
-
-    # 构造跨颌掩码: 如果一个在上一个在下，则禁止连接
     mask_cross_jaw = (is_upper.unsqueeze(1) & is_lower.unsqueeze(0))
     mask_cross_jaw = mask_cross_jaw | mask_cross_jaw.t()  # 双向禁止
 
-    # 合并禁止项: 基础禁止 + 跨颌禁止
     total_forbidden_vert = mask_forbidden_base | mask_cross_jaw
     vert_dist_matrix[total_forbidden_vert] = float('inf')
 
-    # 4. 执行 k-NN (通常 k=1, 找最近的一个替换牙)
     curr_k_vert = min(k_vertical, N - 1)
     if curr_k_vert > 0:
         dists, indices = torch.topk(vert_dist_matrix, k=curr_k_vert, dim=1, largest=False)
         valid_mask = (dists != float('inf'))
-
         source_nodes = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k_vert)
         valid_sources = source_nodes[valid_mask]
         valid_targets = indices[valid_mask]
@@ -173,22 +127,15 @@ def build_multi_relation_graph(boxes, node_centers,
     else:
         edge_index_vertical = torch.empty((2, 0), dtype=torch.long, device=device)
 
-    # =========================================================
-    # E. 构建 edge_index_spatial (Type 3: 空间/兜底边)
-    # =========================================================
-
-    # 使用原始 node_centers
+    # 5. edge_index_spatial
     spatial_dist_matrix = torch.cdist(node_centers, node_centers, p=2)
     spatial_dist_matrix.fill_diagonal_(float('inf'))
-
     curr_k_sp = min(k_spatial, N - 1)
     _, indices_sp = torch.topk(spatial_dist_matrix, k=curr_k_sp, dim=1, largest=False)
-
     source_nodes_sp = torch.arange(N, device=device).unsqueeze(1).expand(N, curr_k_sp)
     edge_index_spatial = torch.stack([source_nodes_sp.flatten(), indices_sp.flatten()], dim=0)
 
-    # 返回 4 种边
-    return edge_index_overlap, edge_index_arch, edge_index_vertical, edge_index_spatial
+    return edge_index_overlap, edge_index_arch, edge_index_vertical, edge_index_spatial,iou_matrix
 
 
 # ==============================================================================
@@ -219,7 +166,6 @@ def generate_gnn_y_labels_local(pred_bboxes_np, pred_scores_np,
     sort_inds = np.argsort(pred_scores_np)[::-1]
     gt_matched = np.zeros(num_gts, dtype=bool)
 
-    # 计算 IoU 矩阵 [Num_Preds, Num_GT]
     iou_matrix = np.array([
         [calculate_iou_np(pred_bboxes_np[i], gt_box) for gt_box in gt_bboxes_np]
         for i in sort_inds
@@ -243,19 +189,80 @@ def generate_gnn_y_labels_local(pred_bboxes_np, pred_scores_np,
 
 
 # ==============================================================================
-# 3. 主图构建函数 (已更新为使用 build_multi_relation_graph)
+# 3. 数据标准化与补全 (新增核心模块)
+# ==============================================================================
+def standardize_input_data(raw_data_item: dict,
+                           filename_to_id: dict,
+                           coco_gt: COCO,
+                           visual_dim: int = 1024) -> Optional[dict]:
+    """
+    统一 YOLO 和 Faster R-CNN 的数据格式。
+    1. 统一 ID: 将 filename 转换为 img_id
+    2. 补全特征: 如果缺少 visual feature，生成零向量
+    3. 补全 Info: 如果缺少 ori_shape，从 COCO 读取
+    """
+
+    # --- 1. ID 统一 ---
+    img_id = raw_data_item.get('img_id')
+
+    # 如果没有 img_id 或者 img_id 为空，尝试通过 filename (YOLO 常见情况)
+    if img_id is None:
+        raw_filename = raw_data_item.get('file_name')  # YOLO 通常有 file_name 或 img_path
+        if raw_filename is None:
+            # 尝试 raw_data_item['img_path']
+            raw_filename = raw_data_item.get('img_path')
+
+        if raw_filename:
+            # 提取纯文件名 (e.g., 'data/imgs/123.jpg' -> '123.jpg')
+            base_name = os.path.basename(raw_filename)
+            if base_name in filename_to_id:
+                img_id = filename_to_id[base_name]
+            else:
+                # 无法匹配到 GT 中的文件名，跳过
+                return None
+        else:
+            return None  # 既无ID也无文件名，无法处理
+
+    # 此时我们有了 img_id，从 COCO 获取权威信息
+    img_info = coco_gt.loadImgs(img_id)[0]
+
+    # --- 2. 补全原始形状 (YOLO 有时缺失) ---
+    if 'ori_shape' not in raw_data_item:
+        raw_data_item['ori_shape'] = (img_info['height'], img_info['width'])
+
+    # --- 3. 补全视觉特征 (YOLO 缺失) ---
+    # 检查是否有 x_cls
+    num_boxes = len(raw_data_item['pred_bboxes'])
+    if 'x_cls' not in raw_data_item or raw_data_item['x_cls'] is None:
+        # 补全全0特征
+        # 注意：后续会有 F.normalize，全0向量归一化后仍为0，是安全的
+        raw_data_item['x_cls'] = np.zeros((num_boxes, visual_dim), dtype=np.float32)
+
+    # 确保是 Numpy 数组
+    if not isinstance(raw_data_item['x_cls'], np.ndarray):
+        raw_data_item['x_cls'] = np.array(raw_data_item['x_cls'])
+
+    # --- 4. 确保 img_id 写入字典 ---
+    raw_data_item['img_id'] = img_id
+    raw_data_item['img_path'] = img_info['file_name']  # 统一用 COCO 的路径
+
+    return raw_data_item
+
+
+# ==============================================================================
+# 4. 主图构建函数
 # ==============================================================================
 def build_graph_from_features(raw_data: dict, gt_data: dict,
                               k_neighbors: int, min_score_threshold: float,
-                              iou_threshold_graph: float, y_penalty: float,ios_threshold_graph:float,k_arch:int) -> Optional[Data]:
+                              iou_threshold_graph: float, y_penalty: float,
+                              ios_threshold_graph: float, k_arch: int) -> Optional[Data]:
     """
-    从原始特征构建单个 AnatomyGAT Data对象。
+    从标准化后的特征构建 AnatomyGAT Data对象。
     """
-    # 1. 提取原始数据
     pred_bboxes_np = raw_data['pred_bboxes']
     pred_scores_np = raw_data['pred_scores']
     pred_labels_np = raw_data['pred_labels']
-    x_cls_np = raw_data['x_cls']
+    x_cls_np = raw_data['x_cls']  # 此时必然存在
     pred_all_class_probs = raw_data['pred_all_class_probs']
 
     gt_bboxes_np = gt_data['gt_bboxes_np']
@@ -264,25 +271,23 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
     img_h, img_w = raw_data['ori_shape'][0], raw_data['ori_shape'][1]
     num_preds = pred_bboxes_np.shape[0]
 
-    if num_preds == 0:
-        return None
+    if num_preds == 0: return None
 
     # 过滤低置信度
     score_mask = pred_scores_np >= min_score_threshold
     num_preds = np.sum(score_mask)
 
-    if num_preds == 0:  # 再次检查过滤后是否为空
-        return None
+    if num_preds == 0: return None
 
-    # 2. 生成 GNN 的 y 标签
+    # 生成 GNN 的 y 标签
     y_vector_np = generate_gnn_y_labels_local(
         pred_bboxes_np, pred_scores_np, gt_bboxes_np, gt_labels_np
     )
     y = y_vector_np[score_mask]
     y_tensor = torch.tensor(y, dtype=torch.long)
 
-    # 3. 特征工程
-    final_bboxes_tensor = torch.tensor(pred_bboxes_np[score_mask], dtype=torch.float)  # xyxy 绝对坐标
+    # 特征工程
+    final_bboxes_tensor = torch.tensor(pred_bboxes_np[score_mask], dtype=torch.float)
     final_scores_tensor = torch.tensor(pred_scores_np[score_mask], dtype=torch.float)
     x_cls_tensor = torch.tensor(x_cls_np[score_mask], dtype=torch.float)
     final_raw_labels_tensor = torch.tensor(pred_labels_np[score_mask], dtype=torch.int)
@@ -290,37 +295,27 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
 
     feature_list_graph = []
     feature_list_prior = []
-    pos_list = []  # 绝对像素坐标 center_x, center_y
+    pos_list = []
 
-    # 计算所有框的中心点
     centers_x = (final_bboxes_tensor[:, 0] + final_bboxes_tensor[:, 2]) / 2
     centers_y = (final_bboxes_tensor[:, 1] + final_bboxes_tensor[:, 3]) / 2
-    pos_abs = torch.stack([centers_x, centers_y], dim=1)  # [N, 2]
+    pos_abs = torch.stack([centers_x, centers_y], dim=1)
 
-    # 计算重心
-    centroid = torch.mean(pos_abs, dim=0)  # [mean_x, mean_y]
-
-    # [新增特征] 重心相对坐标 (2维) -> 总共 8维
+    centroid = torch.mean(pos_abs, dim=0)
     norm_dx = (centers_x - centroid[0]) / img_w
     norm_dy = (centers_y - centroid[1]) / img_h
 
-    # [向量化傅里叶编码]
-    # 输入 [N], 输出 [N, 8] (2D Tensor)
     enc_dx = fourier_encode(norm_dx, num_bands=4)
     enc_dy = fourier_encode(norm_dy, num_bands=4)
-
-    # 拼接相对坐标特征 [N, 16]
-    # 这里的 rel_coord_all 是 2D 的 [N, 16]
     rel_coord_all = torch.cat([enc_dx, enc_dy], dim=1)
 
     for i in range(num_preds):
-        bbox = final_bboxes_tensor[i]  # xyxy
+        bbox = final_bboxes_tensor[i]
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
-        x_center, y_center= centers_x[i],centers_y[i]
+        x_center, y_center = centers_x[i], centers_y[i]
         aspect_ratio = w / (h + 1e-6)
 
-        # 几何特征归一化
         geom_shape_features = torch.tensor(
             [(x_center / img_w) * 2 - 1, (y_center / img_h) * 2 - 1, (w / img_w) * 2 - 1, (h / img_h) * 2 - 1])
         area_feature = torch.tensor([(w * h) / (img_w * img_h)]) * 2 - 1
@@ -328,75 +323,64 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
         confidence_score = final_scores_tensor[i].unsqueeze(0) * 2 - 1
         pred_all_class_prob = final_pred_all_class_probs[i]
 
-
-
-
-        # 几何特征 (8维: cx, cy, w, h, area, ratio,x重心，y重心)
-        base_geom = torch.cat([
-            geom_shape_features,  # 4D
-            area_feature,  # 1D
-            aspect_ratio_features,  # 1D
-        ])
-        x_g = torch.cat([base_geom, rel_coord_all[i]])  # 结果是 [22]
+        base_geom = torch.cat([geom_shape_features, area_feature, aspect_ratio_features])
+        x_g = torch.cat([base_geom, rel_coord_all[i]])
 
         feature_list_graph.append(x_g)
-
-        # 先验特征 (50维: 49 class probs + 1 score)
-        x_prior = torch.cat([
-            pred_all_class_prob,
-            confidence_score
-        ])
+        x_prior = torch.cat([pred_all_class_prob, confidence_score])
         feature_list_prior.append(x_prior)
-
         pos_list.append(torch.tensor([x_center, y_center]))
 
-    # 转换为 Tensor
-    x_graph_features = torch.stack(feature_list_graph).float()  # [N, 6]
-    x_visual_features = F.normalize(x_cls_tensor, p=2, dim=-1).float()  # [N, 1024]
-    x_prior_features = torch.stack(feature_list_prior).float()  # [N, 50]
+    x_graph_features = torch.stack(feature_list_graph).float()
 
-    pos = torch.stack(pos_list).float()  # [N, 2] 绝对像素坐标 (用于构图)
+    # [关键] 视觉特征归一化 (如果是填充的0向量，结果仍为0)
+    x_visual_features = F.normalize(x_cls_tensor, p=2, dim=-1).float()
 
-    # 调用 构图算法 ---
-    edge_overlap, edge_arch, e_vert,edge_spatial = build_multi_relation_graph(
-        boxes=final_bboxes_tensor,  # xyxy
-        node_centers=pos,  # cx, cy
+    x_prior_features = torch.stack(feature_list_prior).float()
+    pos = torch.stack(pos_list).float()
+
+    edge_overlap, edge_arch, e_vert, edge_spatial, iou_matrix = build_multi_relation_graph(
+        boxes=final_bboxes_tensor,
+        node_centers=pos,
         scores=final_scores_tensor,
         iou_threshold=iou_threshold_graph,
         ios_threshold=ios_threshold_graph,
-        k_arch=k_arch,  # 牙弓找左右邻居
-        k_spatial=k_neighbors,  # 空间找 k 个
-        y_penalty=y_penalty,  # 垂直惩罚
-        k_vertical=1,#替换牙数量
+        k_arch=k_arch,
+        k_spatial=k_neighbors,
+        y_penalty=y_penalty,
+        k_vertical=1,
         x_penalty=5.0
     )
 
-    # 归一化位置 (用于可视化或额外的几何特征，如果需要)
+    edge_attr_overlap = compute_edge_attributes(edge_overlap, final_bboxes_tensor, pos, img_w, img_h, iou_matrix)
+    edge_attr_arch = compute_edge_attributes(edge_arch, final_bboxes_tensor, pos, img_w, img_h)
+    edge_attr_vert = compute_edge_attributes(e_vert, final_bboxes_tensor, pos, img_w, img_h)
+    edge_attr_spatial = compute_edge_attributes(edge_spatial, final_bboxes_tensor, pos, img_w, img_h)
+
     pos_normalized = torch.stack([
         torch.tensor([(p[0] / img_w) * 2 - 1, (p[1] / img_h) * 2 - 1]) for p in pos
     ]).float()
 
-    # --- 4. 组装并返回 ---
     data_final = Data(
-        # 特征
-        x_visual=x_visual_features,  # [N, 1024]
-        x_geom=x_graph_features,  # [N, 6] (注意：这里我将其重命名为 x_geom 以匹配 model.py)
-        x_prior=x_prior_features,  # [N, 50]
-
-        # 边索引 (三种类型)
+        x_visual=x_visual_features,
+        x_geom=x_graph_features,
+        x_prior=x_prior_features,
+        # 记录拓扑连线 (Prior Mask)
         edge_index_overlap=edge_overlap,
         edge_index_arch=edge_arch,
         edge_index_vertical=e_vert,
         edge_index_spatial=edge_spatial,
+        # 记录拓扑关系特征 (Dynamic Edge Weights 的原材料)
+        edge_attr_overlap=edge_attr_overlap,
+        edge_attr_arch=edge_attr_arch,
+        edge_attr_vertical=edge_attr_vert,
+        edge_attr_spatial=edge_attr_spatial,
 
-        # 标签和元数据
         y=y_tensor,
         pos=pos_normalized,
-        img_id=raw_data['img_id'],  # 确保有 img_id
+        img_id=raw_data['img_id'],
         img_path=raw_data['img_path'],
         ori_shape=torch.tensor(raw_data['ori_shape']),
-
-        # 调试用元数据
         pred_bboxes_raw=final_bboxes_tensor,
         pred_scores_raw=final_scores_tensor,
         pred_labels_raw=final_raw_labels_tensor
@@ -404,45 +388,88 @@ def build_graph_from_features(raw_data: dict, gt_data: dict,
     return data_final
 
 
+def compute_edge_attributes(edge_index, boxes, centers, img_w, img_h, iou_matrix=None):
+    """
+    [新增核心] 将启发式连线转化为可学习的关系特征 (Relational Prior Features)
+    为每条边计算: [归一化 dx, 归一化 dy, 欧氏距离, log宽度比, log高度比, (可选) IoU]
+    """
+    device = boxes.device
+    num_edges = edge_index.shape[1]
+
+    if num_edges == 0:
+        # 如果没有IoU矩阵传入，默认5维特征；否则6维
+        dim = 5 if iou_matrix is None else 6
+        return torch.empty((0, dim), dtype=torch.float, device=device)
+
+    src, dst = edge_index[0], edge_index[1]
+
+    # 1. 相对位置 (用图像宽高归一化)
+    dx = (centers[dst, 0] - centers[src, 0]) / img_w
+    dy = (centers[dst, 1] - centers[src, 1]) / img_h
+    dist = torch.sqrt(dx ** 2 + dy ** 2)
+
+    # 2. 相对尺度 (衡量候选框大小变化)
+    w_src = boxes[src, 2] - boxes[src, 0]
+    h_src = boxes[src, 3] - boxes[src, 1]
+    w_dst = boxes[dst, 2] - boxes[dst, 0]
+    h_dst = boxes[dst, 3] - boxes[dst, 1]
+
+    log_scale_w = torch.log((w_dst + 1e-6) / (w_src + 1e-6))
+    log_scale_h = torch.log((h_dst + 1e-6) / (h_src + 1e-6))
+
+    # 3. 基础边缘特征组合
+    edge_attr = torch.stack([dx, dy, dist, log_scale_w, log_scale_h], dim=1)
+
+    # 4. 如果是 Overlap 竞争边，额外拼接 IoU 作为先验强度
+    if iou_matrix is not None:
+        iou_vals = iou_matrix[src, dst].unsqueeze(1)
+        edge_attr = torch.cat([edge_attr, iou_vals], dim=1)
+
+    return edge_attr
+
+
 # ==============================================================================
-# 4. 主执行函数
+# 5. 主执行函数
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="离线GNN数据构建脚本 (AnatomyGAT V4.1)",
+        description="离线GNN数据构建脚本 (兼容 YOLO/Faster R-CNN)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--input-features', required=True, help="原始特征.pt")
+    parser.add_argument('--input-features', required=True, help="原始特征.pt (List[Dict])")
     parser.add_argument('--gt-json', required=True, help="GT .json")
     parser.add_argument('--output-pt', required=True, help="输出.pt")
 
-    # GNN 构建参数
-    parser.add_argument('-k', '--k-neighbors', type=int, default=9, help="空间边的 k 值 (k_spatial)")
+    parser.add_argument('-k', '--k-neighbors', type=int, default=9, help="空间边的 k 值")
     parser.add_argument('--iou-threshold', type=float, default=0.4, help="重叠边的 IoU 阈值")
-    parser.add_argument('--ios-threshold', type=float, default=0.8, help="重叠边的 IoU 阈值")
-    parser.add_argument('--y-penalty', type=float, default=3.0, help="牙弓边的垂直距离惩罚系数")
-    parser.add_argument('--k-arch', type=int, default=4, help="牙弓边的垂直距离惩罚系数")
+    parser.add_argument('--ios-threshold', type=float, default=0.8, help="IoS 阈值")
+    parser.add_argument('--y-penalty', type=float, default=3.0, help="牙弓边垂直距离惩罚")
+    parser.add_argument('--k-arch', type=int, default=4, help="牙弓边 k 值")
     parser.add_argument('-confidence', type=float, default=0.3, help='节点置信度过滤阈值')
+
+    # [新增] 视觉特征维度参数
+    parser.add_argument('--visual-dim', type=int, default=1024, help='视觉特征维度 (若缺失则填充此维度的0向量)')
 
     args = parser.parse_args()
 
-    # 1. 加载原始特征
-    print(f"正在加载原始特征: {args.input_features}")
-    try:
-        raw_data_list = torch.load(args.input_features)
-    except Exception as e:
-        print(f"加载失败: {e}");
-        return
-
-    # 2. 加载 GT
+    # 1. 加载 GT (先加载GT以建立映射)
     print(f"正在加载 GT: {args.gt_json}")
     try:
         coco_gt = COCO(args.gt_json)
     except Exception as e:
-        print(f"加载失败: {e}");
+        print(f"GT 加载失败: {e}")
         return
 
-    # 构建映射
+    # [新增] 建立 Filename -> ImageID 的映射 (处理 YOLO 文件名索引问题)
+    print("正在建立 Filename -> ID 映射...")
+    filename_to_id = {}
+    for img_info in coco_gt.dataset['images']:
+        # 使用 basename 以防止路径差异 (e.g. data/1.jpg vs 1.jpg)
+        base_name = os.path.basename(img_info['file_name'])
+        filename_to_id[base_name] = img_info['id']
+    print(f"映射建立完成，共 {len(filename_to_id)} 张图片。")
+
+    # 构建类别映射
     coco_id_to_model_idx = {}
     cat_ids = coco_gt.getCatIds(catNms=CLASS_NAMES)
     cats = coco_gt.loadCats(cat_ids)
@@ -450,6 +477,7 @@ def main():
         if cat['name'] in CLASS_NAMES:
             coco_id_to_model_idx[cat['id']] = CLASS_NAMES.index(cat['name'])
 
+    # 缓存 GT 数据
     gt_data_map = {}
     for img_id in coco_gt.getImgIds():
         ann_ids = coco_gt.getAnnIds(imgIds=img_id)
@@ -466,18 +494,50 @@ def main():
             'gt_labels_np': np.array(gt_labels_model_idx) if gt_labels_model_idx else np.empty((0,))
         }
 
+    # 2. 加载原始特征
+    print(f"正在加载输入特征: {args.input_features}")
+    try:
+        raw_data_list = torch.load(args.input_features)
+    except Exception as e:
+        print(f"输入加载失败: {e}")
+        return
+
     # 3. 构建图
     final_gnn_list = []
-    print(f"开始构建 AnatomyGAT 图 (k_sp={args.k_neighbors}, y_penalty={args.y_penalty})...")
+    print(f"开始构建 AnatomyGAT 图...")
 
-    for raw_data in tqdm(raw_data_list, desc="构建中"):
-        img_id = raw_data['img_id']
-        if img_id not in gt_data_map: continue
+    # 计数统计
+    missing_id_count = 0
+    missing_xcls_count = 0
 
+    for raw_data_item in tqdm(raw_data_list, desc="构建中"):
+
+        # [核心修改] 标准化输入数据 (统一 ID, 补全特征)
+        is_missing_xcls = ('x_cls' not in raw_data_item or raw_data_item['x_cls'] is None)
+        standardized_data = standardize_input_data(
+            raw_data_item,
+            filename_to_id,
+            coco_gt,
+            visual_dim=args.visual_dim
+        )
+
+        if standardized_data is None:
+            missing_id_count += 1
+            continue
+
+        if is_missing_xcls:
+            missing_xcls_count += 1
+
+        img_id = standardized_data['img_id']
+
+        # 确保 GT 存在
+        if img_id not in gt_data_map:
+            continue
         gt_data = gt_data_map[img_id]
+
         try:
             gnn_data = build_graph_from_features(
-                raw_data, gt_data,
+                standardized_data, gt_data,
                 k_neighbors=args.k_neighbors,
                 min_score_threshold=args.confidence,
                 iou_threshold_graph=args.iou_threshold,
@@ -489,16 +549,19 @@ def main():
                 final_gnn_list.append(gnn_data)
         except Exception as e:
             print(f"错误 (img_id {img_id}): {e}")
-            import traceback; traceback.print_exc()
+            import traceback;
+            traceback.print_exc()
 
-
+    print(f"\n构建摘要:")
+    print(f" - 输入总数: {len(raw_data_list)}")
+    print(f" - 成功构建: {len(final_gnn_list)}")
+    print(f" - 因 ID/Filename 无法匹配跳过: {missing_id_count}")
+    print(f" - 检测到缺失视觉特征 (已补全0向量): {missing_xcls_count}")
 
     # 4. 保存
-    print(f"完成。生成 {len(final_gnn_list)} 个图。")
     os.makedirs(os.path.dirname(args.output_pt), exist_ok=True)
     torch.save(final_gnn_list, args.output_pt)
-    print(f"保存至: {args.output_pt}")
-
+    print(f"结果已保存至: {args.output_pt}")
 
 
 if __name__ == '__main__':
