@@ -834,3 +834,171 @@ class RecurrentAnatomyGATNew_A(torch.nn.Module):
                 current_dynamic_belief = torch.cat([probs, confidence], dim=1)
 
         return all_step_logits, final_attention_weights, edge_index, edge_type
+
+
+class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
+    def __init__(self, n_classes=49, num_relations=4, num_iterations=5,
+                 use_visual=False, use_geom=True, use_prior=True,
+                 use_edge_features=True, spatial_only=False,
+                 geom_dim=29, edge_attr_dim=11):
+        super().__init__()
+        self.n_classes = n_classes
+        self.background_idx = n_classes - 1
+        self.num_iterations = num_iterations
+        self.use_visual = use_visual
+        self.use_geom = use_geom
+        self.use_prior = use_prior
+        self.use_edge_features = use_edge_features
+        self.spatial_only = spatial_only
+
+        self.visual_encoder = torch.nn.Sequential(
+            torch.nn.Linear(1024, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.geom_encoder = torch.nn.Sequential(
+            torch.nn.Linear(geom_dim, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.prior_encoder = torch.nn.Sequential(
+            torch.nn.Linear((n_classes + 1) * 2, 128), torch.nn.ReLU(), LayerNorm(128)
+        )
+        self.fused_dim = 128 * 3
+
+        self.edge_dim = 64
+        self.edge_encoder = torch.nn.Sequential(
+            torch.nn.Linear(edge_attr_dim, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, self.edge_dim),
+            LayerNorm(self.edge_dim)
+        )
+
+        self.rgat_layer_1 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8,
+            concat=True,
+            dropout=0.2,
+            edge_dim=self.edge_dim
+        )
+        self.norm_1 = LayerNorm(self.fused_dim)
+        self.rgat_layer_2 = RGATConv(
+            in_channels=self.fused_dim,
+            out_channels=48,
+            num_relations=num_relations,
+            heads=8,
+            concat=True,
+            dropout=0.2,
+            edge_dim=self.edge_dim
+        )
+        self.norm_2 = LayerNorm(self.fused_dim)
+
+        self.slot_head = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(128, self.background_idx)
+        )
+        self.quality_head = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.3),
+            torch.nn.Linear(128, 2)
+        )
+
+    def _align_edge_attr(self, edge_attr):
+        expected_dim = self.edge_encoder[0].in_features
+        current_dim = edge_attr.size(1)
+        if current_dim == expected_dim:
+            return edge_attr
+        if current_dim < expected_dim:
+            return F.pad(edge_attr, (0, expected_dim - current_dim), value=0.0)
+        return edge_attr[:, :expected_dim]
+
+    def _build_edges(self, data, device):
+        edge_idx_list = [
+            data.edge_index_overlap, data.edge_index_arch,
+            data.edge_index_vertical, data.edge_index_spatial
+        ]
+        edge_index = torch.cat([e.to(device) for e in edge_idx_list], dim=1)
+        type_overlap = torch.zeros(data.edge_index_overlap.size(1), dtype=torch.long, device=device)
+        type_arch = torch.ones(data.edge_index_arch.size(1), dtype=torch.long, device=device)
+        type_vertical = torch.full((data.edge_index_vertical.size(1),), 2, dtype=torch.long, device=device)
+        type_spatial = torch.full((data.edge_index_spatial.size(1),), 3, dtype=torch.long, device=device)
+        edge_type = torch.cat([type_overlap, type_arch, type_vertical, type_spatial], dim=0)
+
+        raw_edge_attr = torch.cat([
+            self._align_edge_attr(data.edge_attr_overlap.to(device)),
+            self._align_edge_attr(data.edge_attr_arch.to(device)),
+            self._align_edge_attr(data.edge_attr_vertical.to(device)),
+            self._align_edge_attr(data.edge_attr_spatial.to(device)),
+        ], dim=0)
+
+        if self.spatial_only:
+            mask = edge_type == 3
+            edge_index = edge_index[:, mask]
+            raw_edge_attr = raw_edge_attr[mask]
+            edge_type = torch.zeros_like(edge_type[mask])
+
+        encoded_edge_attr = self.edge_encoder(raw_edge_attr)
+        if not self.use_edge_features:
+            encoded_edge_attr = torch.zeros_like(encoded_edge_attr)
+        return edge_index, edge_type, encoded_edge_attr
+
+    def forward(self, data, return_att=False):
+        device = data.x_visual.device
+        edge_index, edge_type, encoded_edge_attr = self._build_edges(data, device)
+
+        h_visual = self.visual_encoder(data.x_visual)
+        if not self.use_visual:
+            h_visual = torch.zeros_like(h_visual)
+
+        h_geom = self.geom_encoder(data.x_geom)
+        if not self.use_geom:
+            h_geom = torch.zeros_like(h_geom)
+
+        original_prior = data.x_prior.to(device)
+        if not self.use_prior:
+            original_prior = torch.zeros_like(original_prior)
+
+        current_dynamic_belief = original_prior.clone()
+        all_step_outputs = []
+        final_attention_weights = None
+
+        for t in range(self.num_iterations):
+            combined_prior_input = torch.cat([original_prior, current_dynamic_belief], dim=1)
+            h_prior = self.prior_encoder(combined_prior_input)
+            h_0 = torch.cat([h_visual, h_geom, h_prior], dim=-1)
+
+            h_1 = self.rgat_layer_1(h_0, edge_index, edge_type, edge_attr=encoded_edge_attr)
+            h_1 = F.elu(h_1) + h_0
+            h_1 = self.norm_1(h_1)
+
+            is_last_iter = t == self.num_iterations - 1
+            if return_att and is_last_iter:
+                h_2, (_, alpha) = self.rgat_layer_2(
+                    h_1, edge_index, edge_type, edge_attr=encoded_edge_attr,
+                    return_attention_weights=True
+                )
+                final_attention_weights = alpha.mean(dim=1)
+            else:
+                h_2 = self.rgat_layer_2(h_1, edge_index, edge_type, edge_attr=encoded_edge_attr)
+
+            h_2 = F.elu(h_2) + h_1
+            h_2 = self.norm_2(h_2)
+
+            slot_logits = self.slot_head(h_2)
+            quality_logits = self.quality_head(h_2)
+            all_step_outputs.append({
+                "slot_logits": slot_logits,
+                "quality_logits": quality_logits,
+            })
+
+            if t < self.num_iterations - 1:
+                slot_probs = F.softmax(slot_logits, dim=1)
+                quality_probs = F.softmax(quality_logits, dim=1)
+                bg_prob = quality_probs[:, :1]
+                confidence, _ = torch.max(slot_probs, dim=1, keepdim=True)
+                current_dynamic_belief = torch.cat([slot_probs, bg_prob, confidence], dim=1)
+
+        if return_att:
+            return all_step_outputs, final_attention_weights, edge_index, edge_type
+        return all_step_outputs
