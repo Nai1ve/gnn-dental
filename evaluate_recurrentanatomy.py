@@ -18,20 +18,21 @@ from model import RecurrentAnatomyGATNew_A
 # 1. 核心配置
 # ==============================================================================
 
-DEFAULT_MODEL_PATH = 'checkpoints/AnatomyGATCorrectionCE_NoVisual_Edge_Geom_Prior/best_model.pth'
+DEFAULT_MODEL_PATH = 'checkpoints/AnatomyGATCorrectionCE_Visual_Edge_Geom_Prior_T5/best_model.pth'
 DEFAULT_TEST_DATA_PATH = 'gnn_data/test_ccsw_sin_arch4_edge_01.pt'
-DEFAULT_OUTPUT_NAME = 'graph_by_graph_predictions_recurrent_ccsw_i1_correction.pt'
+DEFAULT_OUTPUT_NAME = 'graph_by_graph_predictions_recurrent_ccsw_i5_visual_correction.pt'
 
 N_CLASSES = 49
 BACKGROUND_IDX = 48
 NUM_RELATIONS = 4
-NUM_ITERATIONS = 1
+NUM_ITERATIONS = 5
 BATCH_SIZE = 16
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-RELABEL_MARGIN = 0.15
-RELABEL_MIN_PROB = 0.35
-DUPLICATE_IOU_THRESHOLD = 0.65
+RELABEL_MARGIN = 0.02
+RELABEL_MIN_PROB = 0.12
+DUPLICATE_IOU_THRESHOLD = 0.50
+DUPLICATE_IOS_THRESHOLD = 0.75
 
 CONFUSION_SET_CLASSES = {
     11, 12,
@@ -57,7 +58,10 @@ def parse_args():
     parser.add_argument('--relabel-margin', type=float, default=RELABEL_MARGIN)
     parser.add_argument('--relabel-min-prob', type=float, default=RELABEL_MIN_PROB)
     parser.add_argument('--duplicate-iou-threshold', type=float, default=DUPLICATE_IOU_THRESHOLD)
-    parser.add_argument('--use-visual', action='store_true', help='Enable visual features. Default is off.')
+    parser.add_argument('--duplicate-ios-threshold', type=float, default=DUPLICATE_IOS_THRESHOLD)
+    parser.set_defaults(use_visual=True)
+    parser.add_argument('--use-visual', dest='use_visual', action='store_true', help='Enable visual features.')
+    parser.add_argument('--no-visual', dest='use_visual', action='store_false', help='Disable visual features.')
     return parser.parse_args()
 
 
@@ -137,6 +141,22 @@ def box_iou_one_to_many(box, boxes):
     return inter / union.clamp_min(1e-6)
 
 
+def box_ios_one_to_many(box, boxes):
+    x1 = torch.maximum(box[0], boxes[:, 0])
+    y1 = torch.maximum(box[1], boxes[:, 1])
+    x2 = torch.minimum(box[2], boxes[:, 2])
+    y2 = torch.minimum(box[3], boxes[:, 3])
+
+    inter_w = (x2 - x1).clamp_min(0)
+    inter_h = (y2 - y1).clamp_min(0)
+    inter = inter_w * inter_h
+
+    area_box = (box[2] - box[0]).clamp_min(0) * (box[3] - box[1]).clamp_min(0)
+    area_boxes = (boxes[:, 2] - boxes[:, 0]).clamp_min(0) * (boxes[:, 3] - boxes[:, 1]).clamp_min(0)
+    smaller_area = torch.minimum(area_box.expand_as(area_boxes), area_boxes)
+    return inter / smaller_area.clamp_min(1e-6)
+
+
 def conservative_relabel(logits, raw_labels, relabel_margin, relabel_min_prob):
     """
     默认保留 detector 原标签；只有最佳非背景类明显强于原标签时才改编号。
@@ -159,7 +179,7 @@ def conservative_relabel(logits, raw_labels, relabel_margin, relabel_min_prob):
     return final_labels, probs, best_tooth_labels, relabel_mask
 
 
-def duplicate_cleanup(labels, boxes, detector_scores, probs, duplicate_iou_threshold):
+def duplicate_cleanup(labels, boxes, detector_scores, probs, duplicate_iou_threshold, duplicate_ios_threshold):
     """
     只清理同一最终牙位的强重叠重复框；这一步是唯一会把框置为 background 的后处理。
     """
@@ -188,7 +208,8 @@ def duplicate_cleanup(labels, boxes, detector_scores, probs, duplicate_iou_thres
 
             kept_tensor = torch.stack(kept)
             ious = box_iou_one_to_many(boxes[idx], boxes[kept_tensor])
-            if bool((ious >= duplicate_iou_threshold).any()):
+            ios = box_ios_one_to_many(boxes[idx], boxes[kept_tensor])
+            if bool(((ious >= duplicate_iou_threshold) | (ios >= duplicate_ios_threshold)).any()):
                 labels[idx] = BACKGROUND_IDX
                 duplicate_mask[idx] = True
             else:
@@ -197,7 +218,19 @@ def duplicate_cleanup(labels, boxes, detector_scores, probs, duplicate_iou_thres
     return labels, duplicate_mask
 
 
-def postprocess_graph(logits, graph, relabel_margin, relabel_min_prob, duplicate_iou_threshold):
+def calibrate_scores(detector_scores, final_labels, probs):
+    """
+    Keep detector scores as the main confidence and apply a light GNN confidence calibration.
+    """
+    safe_labels = final_labels.clamp(0, N_CLASSES - 1)
+    label_probs = probs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
+    bg_probs = probs[:, BACKGROUND_IDX]
+    confidence_delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
+    multiplier = (1.0 + 0.15 * confidence_delta).clamp(0.85, 1.15)
+    return (detector_scores * multiplier).clamp(0.0, 1.0)
+
+
+def postprocess_graph(logits, graph, relabel_margin, relabel_min_prob, duplicate_iou_threshold, duplicate_ios_threshold):
     raw_labels = get_prior_labels(graph).to(logits.device)
     detector_scores = get_detector_scores(graph).to(logits.device)
     boxes = get_raw_boxes(graph).to(logits.device)
@@ -206,12 +239,14 @@ def postprocess_graph(logits, graph, relabel_margin, relabel_min_prob, duplicate
         logits, raw_labels, relabel_margin, relabel_min_prob
     )
     postprocessed, duplicate_mask = duplicate_cleanup(
-        relabeled, boxes, detector_scores, probs, duplicate_iou_threshold
+        relabeled, boxes, detector_scores, probs, duplicate_iou_threshold, duplicate_ios_threshold
     )
+    calibrated_scores = calibrate_scores(detector_scores, postprocessed, probs)
     return {
         'pred_original': raw_labels.detach().cpu(),
         'pred_model_best_tooth': best_tooth_labels.detach().cpu(),
         'pred_postprocessed': postprocessed.detach().cpu(),
+        'pred_scores_gnn': calibrated_scores.detach().cpu(),
         'gnn_probs': probs.detach().cpu(),
         'gnn_logits': logits.detach().cpu(),
         'relabel_mask': relabel_mask.detach().cpu(),
@@ -251,7 +286,8 @@ def generate_per_graph_predictions(model, test_data_list, device, save_path, arg
             graph,
             args.relabel_margin,
             args.relabel_min_prob,
-            args.duplicate_iou_threshold
+            args.duplicate_iou_threshold,
+            args.duplicate_ios_threshold
         )
 
         y_true = graph.y.long().cpu()
@@ -271,6 +307,7 @@ def generate_per_graph_predictions(model, test_data_list, device, save_path, arg
             'relabel_mask': processed['relabel_mask'],
             'duplicate_suppressed_mask': processed['duplicate_suppressed_mask'],
             'pred_scores_raw': raw_scores,
+            'pred_scores_gnn': processed['pred_scores_gnn'],
             'edge_index': edge_index.cpu().numpy() if edge_index is not None else None,
             'att_weights': att_weights.cpu().numpy() if att_weights is not None else None,
             'edge_types': edge_type.cpu().numpy() if edge_type is not None else None,
@@ -332,7 +369,8 @@ def evaluate_aggregate(model, loader, device, args):
                 graph,
                 args.relabel_margin,
                 args.relabel_min_prob,
-                args.duplicate_iou_threshold
+                args.duplicate_iou_threshold,
+                args.duplicate_ios_threshold
             )
 
             all_y_true.append(graph.y.long().cpu().numpy())
@@ -394,7 +432,8 @@ def main():
     logging.info(f"测试数据文件: {args.test_data_path}")
     logging.info(
         f"后处理参数: relabel_margin={args.relabel_margin}, "
-        f"relabel_min_prob={args.relabel_min_prob}, duplicate_iou={args.duplicate_iou_threshold}"
+        f"relabel_min_prob={args.relabel_min_prob}, duplicate_iou={args.duplicate_iou_threshold}, "
+        f"duplicate_ios={args.duplicate_ios_threshold}"
     )
 
     if not os.path.exists(args.model_path):

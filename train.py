@@ -8,10 +8,11 @@ from torch_geometric.loader import DataLoader
 import matplotlib.pyplot as plt
 
 USE_EDGE_FEATURES = True  # 消融 1: 是否启用动态边缘特征
-USE_VISUAL = False
+USE_VISUAL = True
 USE_GEOM = True
 USE_PRIOR = True
 SPATIAL_ONLY = False
+NUM_ITERATIONS = 5
 CONFUSION_SET_CLASSES = {
     11, 12,  # 上颌右侧切牙
     21, 22,  # 上颌左侧切牙
@@ -31,12 +32,7 @@ data_path = 'gnn_data/train_sin_arch4_edge_01.pt'
 val_data_path = 'gnn_data/val_sin_arch4_edge_01.pt'
 N_CLASSES = 49
 BACKGROUND_IDX = 48
-ablation_suffix = "CorrectionCE"
-if not USE_VISUAL: ablation_suffix += "_NoVisual"
-if USE_EDGE_FEATURES: ablation_suffix += "_Edge"
-if USE_GEOM: ablation_suffix += "_Geom"
-if USE_PRIOR: ablation_suffix += "_Prior"
-if ablation_suffix == "": ablation_suffix = "_FullModel"
+ablation_suffix = "CorrectionCE_Visual_Edge_Geom_Prior_T5"
 
 # 动态覆盖你原来的 model_save_dir
 model_save_dir = f"./checkpoints/AnatomyGAT{ablation_suffix}"
@@ -56,7 +52,7 @@ CLASS_NAMES = [
 # 超参数
 LEARNING_RATE = 1e-5
 BATCH_SIZE = 6  # 可以根据你的显存调整
-EPOCHS = 200
+EPOCHS = 120
 
 PATIENCE_EPOCHS = 20
 
@@ -65,11 +61,14 @@ BG_LOW_SCORE_THRESHOLD = 0.20
 BG_LABEL_SMOOTHING = 0.05
 KEEP_MARGIN = 0.30
 BG_MARGIN = 0.15
-LAMBDA_KEEP_MARGIN = 0.05
+CORRECTION_MARGIN = 0.35
+LAMBDA_KEEP_MARGIN = 0.03
 LAMBDA_BG_MARGIN = 0.02
-BAD_CHANGE_RATE_LIMIT = 0.03
-VAL_RELABEL_MARGIN = 0.15
-VAL_RELABEL_MIN_PROB = 0.35
+LAMBDA_CORRECTION_MARGIN = 0.10
+BAD_CHANGE_RATE_LIMIT = 0.05
+VAL_RELABEL_MARGIN = 0.02
+VAL_RELABEL_MIN_PROB = 0.12
+STEP_LOSS_WEIGHTS = (0.2, 0.35, 0.5, 0.75, 1.0)
 
 
 class CorrectionCriterion(torch.nn.Module):
@@ -102,10 +101,9 @@ class CorrectionCriterion(torch.nn.Module):
         is_tooth = ~is_bg
         is_correction = (raw_label != y_true) & is_tooth
 
-        weights[is_tooth] = 1.0
-        weights[is_correction] = 1.5
-        weights[is_bg & (scores < BG_LOW_SCORE_THRESHOLD)] = 0.4
-        weights[is_bg & (scores >= BG_LOW_SCORE_THRESHOLD)] = 0.2
+        weights[is_tooth] = 1.2
+        weights[is_correction] = 4.0
+        weights[is_bg] = 0.25
         return weights, raw_label, scores
 
     def _soft_ce(self, logits, y_true, weights):
@@ -134,6 +132,18 @@ class CorrectionCriterion(torch.nn.Module):
         max_competitor = competitor_logits.max(dim=1).values
         return F.relu(margin + max_competitor - target_logits).mean()
 
+    @staticmethod
+    def _pair_margin_loss(logits, positive_labels, negative_labels, mask, margin):
+        if not mask.any():
+            return logits.new_tensor(0.0)
+
+        selected_logits = logits[mask]
+        positive = positive_labels[mask]
+        negative = negative_labels[mask].clamp(0, logits.size(1) - 1)
+        pos_logits = selected_logits.gather(1, positive.unsqueeze(1)).squeeze(1)
+        neg_logits = selected_logits.gather(1, negative.unsqueeze(1)).squeeze(1)
+        return F.relu(margin + neg_logits - pos_logits).mean()
+
     def forward(self, logits, batch):
         y_true = batch.y.long()
         weights, raw_label, scores = self._sample_weights(batch, y_true)
@@ -141,17 +151,27 @@ class CorrectionCriterion(torch.nn.Module):
         ce_loss = self._soft_ce(logits, y_true, weights)
 
         keep_mask = (raw_label == y_true) & (y_true != self.background_idx)
+        correction_mask = (raw_label != y_true) & (y_true != self.background_idx)
         keep_margin_loss = self._target_margin_loss(logits, y_true, keep_mask, KEEP_MARGIN)
+        correction_margin_loss = self._pair_margin_loss(
+            logits, y_true, raw_label, correction_mask, CORRECTION_MARGIN
+        )
 
         high_conf_bg_mask = (y_true == self.background_idx) & (scores >= BG_LOW_SCORE_THRESHOLD)
         bg_margin_loss = self._target_margin_loss(
             logits, torch.full_like(y_true, self.background_idx), high_conf_bg_mask, BG_MARGIN
         )
 
-        total_loss = ce_loss + LAMBDA_KEEP_MARGIN * keep_margin_loss + LAMBDA_BG_MARGIN * bg_margin_loss
+        total_loss = (
+            ce_loss
+            + LAMBDA_KEEP_MARGIN * keep_margin_loss
+            + LAMBDA_CORRECTION_MARGIN * correction_margin_loss
+            + LAMBDA_BG_MARGIN * bg_margin_loss
+        )
         loss_parts = {
             'ce': ce_loss.detach(),
             'keep_margin': keep_margin_loss.detach(),
+            'correction_margin': correction_margin_loss.detach(),
             'bg_margin': bg_margin_loss.detach()
         }
         return total_loss, loss_parts
@@ -162,6 +182,7 @@ def train_epoch(model, loader, criterion, optimizer):
     total_loss = 0
     total_ce = 0
     total_keep_margin = 0
+    total_correction_margin = 0
     total_bg_margin = 0
 
     for batch in loader:
@@ -172,7 +193,10 @@ def train_epoch(model, loader, criterion, optimizer):
         all_step_logits, attention_weights, model_returned_edge_index, model_returned_edge_type = model(batch)
 
         batch_loss = 0
-        loss_weights = torch.linspace(0.5, 1.0, steps=len(all_step_logits), device=device)
+        if len(all_step_logits) == len(STEP_LOSS_WEIGHTS):
+            loss_weights = torch.tensor(STEP_LOSS_WEIGHTS, device=device)
+        else:
+            loss_weights = torch.linspace(0.2, 1.0, steps=len(all_step_logits), device=device)
 
         for i, logits in enumerate(all_step_logits):
             weight = loss_weights[i]
@@ -185,6 +209,7 @@ def train_epoch(model, loader, criterion, optimizer):
         total_loss += batch_loss.item() * batch.num_graphs
         total_ce += loss_parts['ce'].item() * batch.num_graphs
         total_keep_margin += loss_parts['keep_margin'].item() * batch.num_graphs
+        total_correction_margin += loss_parts['correction_margin'].item() * batch.num_graphs
         total_bg_margin += loss_parts['bg_margin'].item() * batch.num_graphs
 
     dataset_size = len(loader.dataset)
@@ -192,6 +217,7 @@ def train_epoch(model, loader, criterion, optimizer):
         total_loss / dataset_size,
         total_ce / dataset_size,
         total_keep_margin / dataset_size,
+        total_correction_margin / dataset_size,
         total_bg_margin / dataset_size
     )
 
@@ -331,7 +357,7 @@ def main():
     logging.info(f"监控的混淆集类别: {CONFUSION_SET_CLASSES}")
 
 
-    model = RecurrentAnatomyGATNew_A(n_classes=N_CLASSES, num_relations=4, num_iterations=1,
+    model = RecurrentAnatomyGATNew_A(n_classes=N_CLASSES, num_relations=4, num_iterations=NUM_ITERATIONS,
                                      use_visual=USE_VISUAL, use_geom=USE_GEOM, use_prior=USE_PRIOR,
                                      use_edge_features=USE_EDGE_FEATURES, spatial_only=SPATIAL_ONLY).to(device)
     logging.info(f"模型 {type(model).__name__} 已实例化 (n_classes={N_CLASSES})")
@@ -401,15 +427,17 @@ def main():
 
     for epoch in range(1, EPOCHS + 1):
 
-        train_loss, train_ce, train_keep_margin, train_bg_margin = train_epoch(model, train_loader, criterion, optimizer)
+        train_loss, train_ce, train_keep_margin, train_corr_margin, train_bg_margin = train_epoch(
+            model, train_loader, criterion, optimizer
+        )
         val_loss, val_accuracy, val_acc_confusion, val_diag = validate_epoch(model, val_loader, criterion)
 
         current_lr = optimizer.param_groups[0]['lr']
         clinical_score = (
             0.45 * val_accuracy
             + 0.45 * val_acc_confusion
-            + 0.80 * val_diag['correction_rate']
-            - 2.00 * val_diag['bad_change_rate']
+            + 1.50 * val_diag['correction_rate']
+            - 1.50 * val_diag['bad_change_rate']
             - 0.50 * val_diag['pred_bg_for_tooth_rate']
             - 0.05 * val_loss
         )
@@ -422,7 +450,9 @@ def main():
 
         log_message = (
             f"Epoch: {epoch:03d}, LR: {current_lr:.1e}, "
-            f"Train Loss: {train_loss:.4f} (CE={train_ce:.4f}, KeepM={train_keep_margin:.4f}, BgM={train_bg_margin:.4f}), "
+            f"Train Loss: {train_loss:.4f} "
+            f"(CE={train_ce:.4f}, KeepM={train_keep_margin:.4f}, CorrM={train_corr_margin:.4f}, "
+            f"BgM={train_bg_margin:.4f}), "
             f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}, Confusion Acc: {val_acc_confusion:.4f}, "
             f"Correction Rate: {val_diag['correction_rate']:.4f}, Bad Change Rate: {val_diag['bad_change_rate']:.4f}, "
             f"Pred-BG Tooth Rate: {val_diag['pred_bg_for_tooth_rate']:.4f}, Score: {clinical_score:.4f}"
