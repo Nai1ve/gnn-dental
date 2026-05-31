@@ -41,6 +41,34 @@ def parse_args():
     parser.add_argument("--relabel-min-prob", type=float, default=0.20)
     parser.add_argument("--duplicate-iou-threshold", type=float, default=0.50)
     parser.add_argument("--duplicate-ios-threshold", type=float, default=0.75)
+    parser.add_argument(
+        "--score-calibration",
+        choices=("raw", "gnn_delta"),
+        default="raw",
+        help="raw keeps detector scores except soft suppression; gnn_delta applies the older light GNN probability multiplier.",
+    )
+    parser.add_argument(
+        "--duplicate-action",
+        choices=("low_score", "background"),
+        default="low_score",
+        help=(
+            "How to suppress duplicates after one-to-one slot selection. "
+            "low_score keeps the FDI label for COCO ranking and lowers score below the diagnostic threshold; "
+            "background reproduces the old hard 48 suppression."
+        ),
+    )
+    parser.add_argument("--duplicate-score-cap", type=float, default=0.19)
+    parser.add_argument("--duplicate-score-multiplier", type=float, default=0.35)
+    parser.add_argument("--disable-background-soft-suppression", action="store_true")
+    parser.add_argument("--background-prob-threshold", type=float, default=0.70)
+    parser.add_argument("--background-detector-score-threshold", type=float, default=0.40)
+    parser.add_argument("--background-score-cap", type=float, default=0.19)
+    parser.add_argument("--background-score-multiplier", type=float, default=0.35)
+    parser.add_argument(
+        "--save-attention",
+        action="store_true",
+        help="Save attention tensors. This forces batch_size=1 for the prediction export pass.",
+    )
     return parser.parse_args()
 
 
@@ -144,7 +172,15 @@ def conservative_relabel(class_logits, raw_labels, relabel_margin, relabel_min_p
     return final_labels, probs, best_tooth_labels, relabel_mask
 
 
-def duplicate_cleanup(labels, boxes, detector_scores, class_probs, duplicate_iou_threshold, duplicate_ios_threshold):
+def duplicate_cleanup(
+    labels,
+    boxes,
+    detector_scores,
+    class_probs,
+    duplicate_iou_threshold,
+    duplicate_ios_threshold,
+    duplicate_action="low_score",
+):
     labels = labels.clone()
     duplicate_mask = torch.zeros_like(labels, dtype=torch.bool)
     if labels.numel() <= 1:
@@ -168,22 +204,61 @@ def duplicate_cleanup(labels, boxes, detector_scores, class_probs, duplicate_iou
             ious = box_iou_one_to_many(boxes[idx], boxes[kept_tensor])
             ios = box_ios_one_to_many(boxes[idx], boxes[kept_tensor])
             if bool(((ious >= duplicate_iou_threshold) | (ios >= duplicate_ios_threshold)).any()):
-                labels[idx] = BACKGROUND_IDX
+                if duplicate_action == "background":
+                    labels[idx] = BACKGROUND_IDX
                 duplicate_mask[idx] = True
             else:
                 kept.append(idx)
     return labels, duplicate_mask
 
 
-def calibrate_scores(detector_scores, final_labels, class_probs):
+def calibrate_scores(
+    detector_scores,
+    final_labels,
+    class_probs,
+    duplicate_mask=None,
+    score_calibration="raw",
+    duplicate_action="low_score",
+    duplicate_score_cap=0.19,
+    duplicate_score_multiplier=0.35,
+    background_soft_suppression=True,
+    background_prob_threshold=0.70,
+    background_detector_score_threshold=0.40,
+    background_score_cap=0.19,
+    background_score_multiplier=0.35,
+):
     safe_labels = final_labels.clamp(0, BACKGROUND_IDX)
     label_probs = class_probs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
     bg_probs = class_probs[:, BACKGROUND_IDX]
-    delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
-    multiplier = (1.0 + 0.12 * delta).clamp(0.88, 1.12)
-    calibrated = (detector_scores * multiplier).clamp(0, 1)
+
+    if score_calibration == "gnn_delta":
+        delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
+        multiplier = (1.0 + 0.12 * delta).clamp(0.88, 1.12)
+        calibrated = (detector_scores * multiplier).clamp(0, 1)
+    else:
+        calibrated = detector_scores.clone().clamp(0, 1)
+
     calibrated[final_labels == BACKGROUND_IDX] = detector_scores[final_labels == BACKGROUND_IDX]
-    return calibrated
+    if duplicate_mask is not None and duplicate_action == "low_score" and duplicate_mask.any():
+        capped = torch.full_like(calibrated[duplicate_mask], float(duplicate_score_cap))
+        softened = calibrated[duplicate_mask] * float(duplicate_score_multiplier)
+        calibrated[duplicate_mask] = torch.minimum(softened, capped).clamp(0, 1)
+
+    background_mask = torch.zeros_like(final_labels, dtype=torch.bool)
+    if background_soft_suppression:
+        background_mask = (
+            (bg_probs >= float(background_prob_threshold))
+            & (detector_scores <= float(background_detector_score_threshold))
+            & (final_labels != BACKGROUND_IDX)
+        )
+        if duplicate_mask is not None:
+            background_mask = background_mask & (~duplicate_mask)
+        if background_mask.any():
+            capped = torch.full_like(calibrated[background_mask], float(background_score_cap))
+            softened = calibrated[background_mask] * float(background_score_multiplier)
+            calibrated[background_mask] = torch.minimum(softened, capped).clamp(0, 1)
+
+    return calibrated, background_mask
 
 
 def postprocess_graph(step_output, graph, args):
@@ -204,8 +279,23 @@ def postprocess_graph(step_output, graph, args):
         class_probs,
         args.duplicate_iou_threshold,
         args.duplicate_ios_threshold,
+        args.duplicate_action,
     )
-    calibrated_scores = calibrate_scores(detector_scores, postprocessed, class_probs)
+    calibrated_scores, background_soft_mask = calibrate_scores(
+        detector_scores,
+        postprocessed,
+        class_probs,
+        duplicate_mask,
+        args.score_calibration,
+        args.duplicate_action,
+        args.duplicate_score_cap,
+        args.duplicate_score_multiplier,
+        not args.disable_background_soft_suppression,
+        args.background_prob_threshold,
+        args.background_detector_score_threshold,
+        args.background_score_cap,
+        args.background_score_multiplier,
+    )
     return {
         "pred_original": raw_labels.detach().cpu(),
         "pred_model_best_tooth": best_tooth_labels.detach().cpu(),
@@ -215,6 +305,7 @@ def postprocess_graph(step_output, graph, args):
         "gnn_logits": class_logits.detach().cpu(),
         "relabel_mask": relabel_mask.detach().cpu(),
         "duplicate_suppressed_mask": duplicate_mask.detach().cpu(),
+        "background_soft_suppressed_mask": background_soft_mask.detach().cpu(),
     }
 
 
@@ -224,6 +315,7 @@ def evaluate_aggregate(model, loader, device, args):
     all_y_true, all_pred_original, all_pred_gnn = [], [], []
     relabel_total = 0
     duplicate_suppressed_total = 0
+    background_soft_suppressed_total = 0
     total_inference_time = 0.0
     total_graphs = 0
 
@@ -252,13 +344,17 @@ def evaluate_aggregate(model, loader, device, args):
             all_pred_gnn.append(processed["pred_postprocessed"].numpy())
             relabel_total += int(processed["relabel_mask"].sum())
             duplicate_suppressed_total += int(processed["duplicate_suppressed_mask"].sum())
+            background_soft_suppressed_total += int(processed["background_soft_suppressed_mask"].sum())
             node_offset += num_nodes
 
     avg_latency_ms = (total_inference_time / total_graphs) * 1000 if total_graphs else 0.0
     fps = total_graphs / total_inference_time if total_inference_time > 0 else 0.0
     logging.info("inference speed")
     logging.info(f"total={total_inference_time:.4f}s, graphs={total_graphs}, latency={avg_latency_ms:.4f}ms, fps={fps:.2f}")
-    logging.info(f"relabel nodes={relabel_total}, duplicate suppressed nodes={duplicate_suppressed_total}")
+    logging.info(
+        f"relabel nodes={relabel_total}, duplicate suppressed nodes={duplicate_suppressed_total}, "
+        f"background soft-suppressed nodes={background_soft_suppressed_total}"
+    )
     return (
         np.concatenate(all_y_true),
         np.concatenate(all_pred_original),
@@ -270,39 +366,48 @@ def evaluate_aggregate(model, loader, device, args):
 
 @torch.no_grad()
 def generate_per_graph_predictions(model, test_data_list, device, save_path, args):
-    loader = DataLoader(test_data_list, batch_size=1, shuffle=False)
+    export_batch_size = 1 if args.save_attention else args.batch_size
+    loader = DataLoader(test_data_list, batch_size=export_batch_size, shuffle=False)
     model.eval()
     all_graph_results = []
     for batch in loader:
         batch = batch.to(device)
-        graph = batch.to_data_list()[0]
-        out = model(batch, return_att=True)
+        out = model(batch, return_att=args.save_attention)
         step_output = unpack_last_step(out)
         att_weights, edge_index, edge_type = None, None, None
-        if isinstance(out, tuple) and len(out) >= 4:
+        if args.save_attention and batch.num_graphs == 1 and isinstance(out, tuple) and len(out) >= 4:
             _, att_weights, edge_index, edge_type = out
-        processed = postprocess_graph(step_output, graph, args)
-        all_graph_results.append({
-            "img_id": get_scalar(getattr(graph, "img_id", None)),
-            "img_path": graph.img_path[0] if isinstance(graph.img_path, list) else graph.img_path,
-            "y_true": graph.y.long().cpu(),
-            "slot_y": graph.slot_y.long().cpu() if hasattr(graph, "slot_y") else None,
-            "quality_y": graph.quality_y.long().cpu() if hasattr(graph, "quality_y") else None,
-            "pred_original": processed["pred_original"],
-            "pred_gnn": processed["pred_postprocessed"],
-            "pred_postprocessed": processed["pred_postprocessed"],
-            "pred_model_best_tooth": processed["pred_model_best_tooth"],
-            "pred_scores_raw": get_detector_scores(graph).cpu(),
-            "pred_scores_gnn": processed["pred_scores_gnn"],
-            "gnn_logits": processed["gnn_logits"],
-            "gnn_probs": processed["gnn_probs"],
-            "relabel_mask": processed["relabel_mask"],
-            "duplicate_suppressed_mask": processed["duplicate_suppressed_mask"],
-            "edge_index": edge_index.cpu().numpy() if edge_index is not None else None,
-            "att_weights": att_weights.cpu().numpy() if att_weights is not None else None,
-            "edge_types": edge_type.cpu().numpy() if edge_type is not None else None,
-            "raw_boxes": get_raw_boxes(graph).cpu().numpy(),
-        })
+        node_offset = 0
+        for graph in batch.to_data_list():
+            num_nodes = graph.num_nodes
+            single_step = {
+                "slot_logits": step_output["slot_logits"][node_offset:node_offset + num_nodes],
+                "quality_logits": step_output["quality_logits"][node_offset:node_offset + num_nodes],
+            }
+            processed = postprocess_graph(single_step, graph, args)
+            all_graph_results.append({
+                "img_id": get_scalar(getattr(graph, "img_id", None)),
+                "img_path": graph.img_path[0] if isinstance(graph.img_path, list) else graph.img_path,
+                "y_true": graph.y.long().cpu(),
+                "slot_y": graph.slot_y.long().cpu() if hasattr(graph, "slot_y") else None,
+                "quality_y": graph.quality_y.long().cpu() if hasattr(graph, "quality_y") else None,
+                "pred_original": processed["pred_original"],
+                "pred_gnn": processed["pred_postprocessed"],
+                "pred_postprocessed": processed["pred_postprocessed"],
+                "pred_model_best_tooth": processed["pred_model_best_tooth"],
+                "pred_scores_raw": get_detector_scores(graph).cpu(),
+                "pred_scores_gnn": processed["pred_scores_gnn"],
+                "gnn_logits": processed["gnn_logits"],
+                "gnn_probs": processed["gnn_probs"],
+                "relabel_mask": processed["relabel_mask"],
+                "duplicate_suppressed_mask": processed["duplicate_suppressed_mask"],
+                "background_soft_suppressed_mask": processed["background_soft_suppressed_mask"],
+                "edge_index": edge_index.cpu().numpy() if edge_index is not None else None,
+                "att_weights": att_weights.cpu().numpy() if att_weights is not None else None,
+                "edge_types": edge_type.cpu().numpy() if edge_type is not None else None,
+                "raw_boxes": get_raw_boxes(graph).cpu().numpy(),
+            })
+            node_offset += num_nodes
     torch.save(all_graph_results, save_path)
     logging.info(f"per-graph predictions saved to {save_path}")
 
@@ -343,7 +448,12 @@ def main():
     logging.info(f"test_data={args.test_data_path}, graphs={len(test_data_list)}")
     logging.info(
         f"postprocess: relabel_margin={args.relabel_margin}, relabel_min_prob={args.relabel_min_prob}, "
-        f"duplicate_iou={args.duplicate_iou_threshold}, duplicate_ios={args.duplicate_ios_threshold}"
+        f"duplicate_iou={args.duplicate_iou_threshold}, duplicate_ios={args.duplicate_ios_threshold}, "
+        f"duplicate_action={args.duplicate_action}, duplicate_score_cap={args.duplicate_score_cap}, "
+        f"score_calibration={args.score_calibration}, "
+        f"background_soft_suppression={not args.disable_background_soft_suppression}, "
+        f"background_prob_threshold={args.background_prob_threshold}, "
+        f"background_detector_score_threshold={args.background_detector_score_threshold}"
     )
 
     if not os.path.exists(args.model_path):
