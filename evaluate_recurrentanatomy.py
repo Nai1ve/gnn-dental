@@ -1,38 +1,43 @@
+import argparse
 import logging
 import os
-import torch
+import time
+
+import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import matplotlib.pyplot as plt
-import time
-from torch_geometric.data import DataLoader
-from torch_geometric.data import DataLoader
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from model import RecurrentAnatomyGATNew, RecurrentAnatomyGATNew_A
-from util import enforce_one_to_one_matching
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from torch_geometric.loader import DataLoader
+
+from model import RecurrentAnatomyGATNew_A
+
 
 # ==============================================================================
 # 1. 核心配置
 # ==============================================================================
 
-MODEL_PATH = 'checkpoints/2026-02-22_10-15-26/best_model.pth'
+DEFAULT_MODEL_PATH = 'checkpoints/AnatomyGATCorrectionCE_NoVisual_Edge_Geom_Prior/best_model.pth'
+DEFAULT_TEST_DATA_PATH = 'gnn_data/test_ccsw_sin_arch4_edge_01.pt'
+DEFAULT_OUTPUT_NAME = 'graph_by_graph_predictions_recurrent_ccsw_i1_correction.pt'
 
-TEST_DATA_PATH = 'gnn_data/ccsw_60_final_gnn.pt'  # 请确保这是包含 V4.1+ 结构的新数据
 N_CLASSES = 49
+BACKGROUND_IDX = 48
 NUM_RELATIONS = 4
-NUM_ITERATIONS = 5  # [!! 新增 !!] 必须与训练时设置的迭代次数一致
+NUM_ITERATIONS = 1
 BATCH_SIZE = 16
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 结果保存目录
-RESULTS_SAVE_DIR = os.path.dirname(MODEL_PATH)
+RELABEL_MARGIN = 0.15
+RELABEL_MIN_PROB = 0.35
+DUPLICATE_IOU_THRESHOLD = 0.65
 
-# 混淆集定义 (监控核心指标)
 CONFUSION_SET_CLASSES = {
-    11, 12,  # 上颌右侧切牙
-    21, 22,  # 上颌左侧切牙
-    31, 32,  # 下颌左侧切牙
-    41, 42,  # 下颌右侧切牙
+    11, 12,
+    21, 22,
+    31, 32,
+    41, 42,
     51, 52,
     61, 62,
     71, 72,
@@ -40,11 +45,24 @@ CONFUSION_SET_CLASSES = {
 }
 
 
-# ==============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Evaluate the recurrent anatomy GNN as a conservative tooth-number corrector.'
+    )
+    parser.add_argument('--model-path', default=DEFAULT_MODEL_PATH)
+    parser.add_argument('--test-data-path', default=DEFAULT_TEST_DATA_PATH)
+    parser.add_argument('--output-name', default=DEFAULT_OUTPUT_NAME)
+    parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
+    parser.add_argument('--num-iterations', type=int, default=NUM_ITERATIONS)
+    parser.add_argument('--relabel-margin', type=float, default=RELABEL_MARGIN)
+    parser.add_argument('--relabel-min-prob', type=float, default=RELABEL_MIN_PROB)
+    parser.add_argument('--duplicate-iou-threshold', type=float, default=DUPLICATE_IOU_THRESHOLD)
+    parser.add_argument('--use-visual', action='store_true', help='Enable visual features. Default is off.')
+    return parser.parse_args()
 
 
 def calculate_metrics(y_true, y_pred, confusion_set):
-    """计算总体准确率和混淆集准确率"""
+    """计算总体准确率和混淆集准确率。"""
     overall_acc = accuracy_score(y_true, y_pred)
 
     mask = np.isin(y_true, list(confusion_set))
@@ -60,8 +78,7 @@ def calculate_metrics(y_true, y_pred, confusion_set):
 
 
 def plot_confusion_matrix(y_true, y_pred, class_names, title, save_path):
-    """绘制并保存混淆矩阵"""
-    # 过滤掉背景类(48)以便看得更清楚，或者保留全部
+    """绘制并保存混淆矩阵。"""
     labels = range(len(class_names))
     cm = confusion_matrix(y_true, y_pred, labels=labels)
 
@@ -76,10 +93,141 @@ def plot_confusion_matrix(y_true, y_pred, class_names, title, save_path):
     plt.close()
 
 
+def get_prior_labels(graph, n_classes=N_CLASSES):
+    if hasattr(graph, 'pred_labels_raw'):
+        return graph.pred_labels_raw.long()
+    return graph.x_prior[:, :n_classes].argmax(dim=1).long()
+
+
+def get_detector_scores(graph):
+    if hasattr(graph, 'pred_scores_raw'):
+        return graph.pred_scores_raw.float()
+    return ((graph.x_prior[:, -1].float() + 1.0) / 2.0).clamp(0.0, 1.0)
+
+
+def get_raw_boxes(graph):
+    if hasattr(graph, 'pred_bboxes_raw'):
+        return graph.pred_bboxes_raw.float()
+    return graph.pos.float()
+
+
+def get_scalar(value, default=-1):
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return int(value.reshape(-1)[0].detach().cpu().item())
+    return int(value)
+
+
+def box_iou_one_to_many(box, boxes):
+    x1 = torch.maximum(box[0], boxes[:, 0])
+    y1 = torch.maximum(box[1], boxes[:, 1])
+    x2 = torch.minimum(box[2], boxes[:, 2])
+    y2 = torch.minimum(box[3], boxes[:, 3])
+
+    inter_w = (x2 - x1).clamp_min(0)
+    inter_h = (y2 - y1).clamp_min(0)
+    inter = inter_w * inter_h
+
+    area_box = (box[2] - box[0]).clamp_min(0) * (box[3] - box[1]).clamp_min(0)
+    area_boxes = (boxes[:, 2] - boxes[:, 0]).clamp_min(0) * (boxes[:, 3] - boxes[:, 1]).clamp_min(0)
+    union = area_box + area_boxes - inter
+    return inter / union.clamp_min(1e-6)
+
+
+def conservative_relabel(logits, raw_labels, relabel_margin, relabel_min_prob):
+    """
+    默认保留 detector 原标签；只有最佳非背景类明显强于原标签时才改编号。
+    background 不直接删框。
+    """
+    probs = F.softmax(logits, dim=1)
+    raw_labels = raw_labels.to(logits.device).clamp(0, N_CLASSES - 1)
+
+    best_tooth_probs, best_tooth_labels = probs[:, :BACKGROUND_IDX].max(dim=1)
+    raw_probs = probs.gather(1, raw_labels.unsqueeze(1)).squeeze(1)
+
+    relabel_mask = (
+        (best_tooth_labels != raw_labels)
+        & (best_tooth_probs >= relabel_min_prob)
+        & ((best_tooth_probs - raw_probs) >= relabel_margin)
+    )
+
+    final_labels = raw_labels.clone()
+    final_labels[relabel_mask] = best_tooth_labels[relabel_mask]
+    return final_labels, probs, best_tooth_labels, relabel_mask
+
+
+def duplicate_cleanup(labels, boxes, detector_scores, probs, duplicate_iou_threshold):
+    """
+    只清理同一最终牙位的强重叠重复框；这一步是唯一会把框置为 background 的后处理。
+    """
+    if labels.numel() <= 1:
+        return labels, torch.zeros_like(labels, dtype=torch.bool)
+
+    labels = labels.clone()
+    boxes = boxes.to(labels.device)
+    detector_scores = detector_scores.to(labels.device)
+    duplicate_mask = torch.zeros_like(labels, dtype=torch.bool)
+
+    label_probs = probs.gather(1, labels.clamp(0, N_CLASSES - 1).unsqueeze(1)).squeeze(1)
+    keep_score = detector_scores + 0.25 * label_probs
+
+    for cls_idx in range(BACKGROUND_IDX):
+        cls_indices = torch.where(labels == cls_idx)[0]
+        if cls_indices.numel() <= 1:
+            continue
+
+        order = cls_indices[torch.argsort(keep_score[cls_indices], descending=True)]
+        kept = []
+        for idx in order:
+            if not kept:
+                kept.append(idx)
+                continue
+
+            kept_tensor = torch.stack(kept)
+            ious = box_iou_one_to_many(boxes[idx], boxes[kept_tensor])
+            if bool((ious >= duplicate_iou_threshold).any()):
+                labels[idx] = BACKGROUND_IDX
+                duplicate_mask[idx] = True
+            else:
+                kept.append(idx)
+
+    return labels, duplicate_mask
+
+
+def postprocess_graph(logits, graph, relabel_margin, relabel_min_prob, duplicate_iou_threshold):
+    raw_labels = get_prior_labels(graph).to(logits.device)
+    detector_scores = get_detector_scores(graph).to(logits.device)
+    boxes = get_raw_boxes(graph).to(logits.device)
+
+    relabeled, probs, best_tooth_labels, relabel_mask = conservative_relabel(
+        logits, raw_labels, relabel_margin, relabel_min_prob
+    )
+    postprocessed, duplicate_mask = duplicate_cleanup(
+        relabeled, boxes, detector_scores, probs, duplicate_iou_threshold
+    )
+    return {
+        'pred_original': raw_labels.detach().cpu(),
+        'pred_model_best_tooth': best_tooth_labels.detach().cpu(),
+        'pred_postprocessed': postprocessed.detach().cpu(),
+        'gnn_probs': probs.detach().cpu(),
+        'gnn_logits': logits.detach().cpu(),
+        'relabel_mask': relabel_mask.detach().cpu(),
+        'duplicate_suppressed_mask': duplicate_mask.detach().cpu(),
+    }
+
+
+def unpack_logits(model_output):
+    all_step_logits = model_output[0] if isinstance(model_output, tuple) else model_output
+    return all_step_logits[-1] if isinstance(all_step_logits, list) else all_step_logits
+
+
 @torch.no_grad()
-def generate_per_graph_predictions(model, test_data_list, device, n_classes, save_path):
-    """生成逐图(per-graph)预测文件"""
-    logging.info(f"--- 正在生成逐图预测文件... ---")
+def generate_per_graph_predictions(model, test_data_list, device, save_path, args):
+    """生成逐图(per-graph)预测文件。"""
+    logging.info("--- 正在生成逐图预测文件... ---")
 
     loader = DataLoader(test_data_list, batch_size=1, shuffle=False)
     model.eval()
@@ -87,58 +235,46 @@ def generate_per_graph_predictions(model, test_data_list, device, n_classes, sav
 
     for batch in loader:
         batch = batch.to(device)
+        graph = batch.to_data_list()[0]
 
-        # 获取 img_id
-        if not hasattr(batch, 'img_id'):
-            img_id = -1
-        else:
-            if batch.img_id.dim() > 0:
-                img_id = batch.img_id[0].cpu().numpy().item()
-            else:
-                img_id = batch.img_id.cpu().numpy().item()
+        img_id = get_scalar(getattr(graph, 'img_id', None))
+        img_path = graph.img_path[0] if isinstance(graph.img_path, list) else graph.img_path
 
-        img_path = batch.img_path[0] if isinstance(batch.img_path, list) else batch.img_path
-
-        # 1. 运行 RecurrentAnatomyGATNew
-        # forward 会执行 num_iterations 次循环，返回最终的 logits
         out_gnn = model(batch, return_att=True)
+        final_logits = unpack_logits(out_gnn)
+        att_weights, edge_index, edge_type = None, None, None
+        if isinstance(out_gnn, tuple) and len(out_gnn) >= 4:
+            _, att_weights, edge_index, edge_type = out_gnn
 
-        if isinstance(out_gnn, tuple):
-            # logging.info(f"进入分支A")
-            logits_list, att_weights, edge_index, edge_type = out_gnn
-            final_logits = logits_list[-1]
-        else:
-            # logging.info(f"进入分支B")
-            logging.info(type(out_gnn))
-            final_logits = out_gnn[-1] if isinstance(out_gnn, list) else out_gnn
-            att_weights, edge_index, edge_type = None, None, None
+        processed = postprocess_graph(
+            final_logits,
+            graph,
+            args.relabel_margin,
+            args.relabel_min_prob,
+            args.duplicate_iou_threshold
+        )
 
-        # pred_gnn = final_logits.argmax(dim=1)
-        pred_gnn = enforce_one_to_one_matching(final_logits, background_idx=48, score_threshold=0.1)
-        pred_original = batch.x_prior[:, :n_classes].argmax(dim=1)
-        y_true = batch.y.long()
-
-        if hasattr(batch, 'pred_bboxes_raw'):
-            # [N, 4]
-            raw_boxes = batch.pred_bboxes_raw.cpu().numpy()
-        else:
-            # 如果万一没有 raw，再退化到用 pos (归一化坐标)
-            # 但你定义里有，所以这里基本不会走
-            raw_boxes = batch.pos.cpu().numpy()
+        y_true = graph.y.long().cpu()
+        raw_boxes = get_raw_boxes(graph).cpu().numpy()
+        raw_scores = get_detector_scores(graph).cpu()
 
         graph_result_dict = {
             'img_id': img_id,
-            'img_path': img_path,  # [新增] 直接存路径，方便读取
-            'y_true': y_true.cpu(),
-            'pred_original': pred_original.cpu(),
-            'pred_gnn': pred_gnn.cpu(),
-
-            # --- 可视化核心数据 ---
+            'img_path': img_path,
+            'y_true': y_true,
+            'pred_original': processed['pred_original'],
+            'pred_gnn': processed['pred_postprocessed'],
+            'pred_postprocessed': processed['pred_postprocessed'],
+            'pred_model_best_tooth': processed['pred_model_best_tooth'],
+            'gnn_logits': processed['gnn_logits'],
+            'gnn_probs': processed['gnn_probs'],
+            'relabel_mask': processed['relabel_mask'],
+            'duplicate_suppressed_mask': processed['duplicate_suppressed_mask'],
+            'pred_scores_raw': raw_scores,
             'edge_index': edge_index.cpu().numpy() if edge_index is not None else None,
             'att_weights': att_weights.cpu().numpy() if att_weights is not None else None,
             'edge_types': edge_type.cpu().numpy() if edge_type is not None else None,
-
-            'raw_boxes': raw_boxes  # 存这个！画图时算中心点: (x1+x2)/2
+            'raw_boxes': raw_boxes,
         }
         all_graph_results.append(graph_result_dict)
 
@@ -150,19 +286,18 @@ def generate_per_graph_predictions(model, test_data_list, device, n_classes, sav
 
 
 @torch.no_grad()
-def evaluate_aggregate(model, loader, device, n_classes):
-    """计算整个测试集的聚合指标，并测量推理速度"""
+def evaluate_aggregate(model, loader, device, args):
+    """计算整个测试集的聚合指标，并测量网络推理速度。"""
     model.eval()
     all_y_true = []
     all_pred_original = []
     all_pred_gnn = []
+    relabel_total = 0
+    duplicate_suppressed_total = 0
 
-    # --- [新增] 速度测量变量 ---
     total_inference_time = 0.0
     total_graphs = 0
 
-    # --- [新增] GPU 预热 (Warmup) ---
-    # 跑一个小批次让 GPU 进入状态，避免第一次推理过慢影响统计
     if device.type == 'cuda':
         dummy_batch = next(iter(loader)).to(device)
         _ = model(dummy_batch)
@@ -174,82 +309,75 @@ def evaluate_aggregate(model, loader, device, n_classes):
         batch = batch.to(device)
         num_graphs_in_batch = batch.num_graphs
 
-        # ==========================
-        # [核心] 精准计时开始
-        # ==========================
         if device.type == 'cuda':
             torch.cuda.synchronize()
         start_time = time.time()
 
-        # 模型推理
         out_gnn = model(batch)
+        final_logits = unpack_logits(out_gnn)
 
-        # [替换原有的解包逻辑]: 处理包含注意力的元组输出
-        all_step_logits = out_gnn[0] if isinstance(out_gnn, tuple) else out_gnn
-        final_logits = all_step_logits[-1] if isinstance(all_step_logits, list) else all_step_logits
-
-        # 这里保持你的精准测速结束 (因为后处理不计入模型网络延迟)
         if device.type == 'cuda':
             torch.cuda.synchronize()
         end_time = time.time()
-        # ==========================
-        # [核心] 精准计时结束
-        # ==========================
 
-        batch_time = end_time - start_time
-        total_inference_time += batch_time
+        total_inference_time += end_time - start_time
         total_graphs += num_graphs_in_batch
 
-        # ------------------------------------------------------------------
-        # [核心修改区开始]：单图切片应用匈牙利算法
-        # ------------------------------------------------------------------
-        # 预先分配一个张量存储校正后的结果
-        pred_gnn_tensor = torch.zeros(final_logits.size(0), dtype=torch.long, device=device)
         node_offset = 0
-
-        # 将 Batch 重新拆分为单图，逐图执行 1对1 约束匹配
         for graph in batch.to_data_list():
             num_nodes = graph.num_nodes
-            single_img_logits = final_logits[node_offset: node_offset + num_nodes]
-
-            # 执行匈牙利算法
-            pred_gnn_tensor[node_offset: node_offset + num_nodes] = enforce_one_to_one_matching(
-                single_img_logits, background_idx=48, score_threshold=0.1
+            single_logits = final_logits[node_offset: node_offset + num_nodes]
+            processed = postprocess_graph(
+                single_logits,
+                graph,
+                args.relabel_margin,
+                args.relabel_min_prob,
+                args.duplicate_iou_threshold
             )
+
+            all_y_true.append(graph.y.long().cpu().numpy())
+            all_pred_original.append(processed['pred_original'].numpy())
+            all_pred_gnn.append(processed['pred_postprocessed'].numpy())
+            relabel_total += int(processed['relabel_mask'].sum())
+            duplicate_suppressed_total += int(processed['duplicate_suppressed_mask'].sum())
             node_offset += num_nodes
 
-        pred_gnn = pred_gnn_tensor.cpu().numpy()
-        # ------------------------------------------------------------------
-        # [核心修改区结束]
-        # ------------------------------------------------------------------
-        pred_original = batch.x_prior[:, :n_classes].argmax(dim=1)
-        y_true = batch.y.long()
-
-        all_y_true.append(y_true.cpu().numpy())
-        all_pred_original.append(pred_original.cpu().numpy())
-        all_pred_gnn.append(pred_gnn)
-
-    # 拼接
     y_true = np.concatenate(all_y_true)
     pred_original = np.concatenate(all_pred_original)
     pred_gnn = np.concatenate(all_pred_gnn)
 
-    # --- [新增] 计算速度指标 ---
-    avg_latency_ms = (total_inference_time / total_graphs) * 1000  # 毫秒/张
-    fps = total_graphs / total_inference_time  # 张/秒
+    avg_latency_ms = (total_inference_time / total_graphs) * 1000 if total_graphs > 0 else 0.0
+    fps = total_graphs / total_inference_time if total_inference_time > 0 else 0.0
 
-    logging.info(f"\n⚡️ 推理速度统计 ⚡️")
+    logging.info("\n推理速度统计")
     logging.info(f"总耗时: {total_inference_time:.4f}s | 处理图数: {total_graphs}")
     logging.info(f"平均延迟 (Latency): {avg_latency_ms:.4f} ms/image")
     logging.info(f"吞吐量 (Throughput): {fps:.2f} FPS")
+    logging.info(f"保守 relabel 节点数: {relabel_total}")
+    logging.info(f"duplicate cleanup 抑制节点数: {duplicate_suppressed_total}")
 
-    # 返回增加速度指标
     return y_true, pred_original, pred_gnn, fps, avg_latency_ms
 
 
+def build_model(args):
+    return RecurrentAnatomyGATNew_A(
+        n_classes=N_CLASSES,
+        num_relations=NUM_RELATIONS,
+        num_iterations=args.num_iterations,
+        use_visual=args.use_visual,
+        use_geom=True,
+        use_prior=True,
+        use_edge_features=True,
+        spatial_only=False
+    ).to(DEVICE)
+
+
 def main():
-    # 日志设置
-    log_file_path = os.path.join(RESULTS_SAVE_DIR, 'evaluation_recurrent.log')
+    args = parse_args()
+    results_save_dir = os.path.dirname(args.model_path) or '.'
+    os.makedirs(results_save_dir, exist_ok=True)
+
+    log_file_path = os.path.join(results_save_dir, 'evaluation_recurrent.log')
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(message)s',
@@ -259,79 +387,73 @@ def main():
         ]
     )
     logging.info(f"使用设备: {DEVICE}")
-    logging.info(f"评估模型: RecurrentAnatomyGATNew (Relations={NUM_RELATIONS}, Iterations={NUM_ITERATIONS})")
-    logging.info(f"测试数据文件:{TEST_DATA_PATH}")
-    # --- 1. 加载 Recurrent 模型 ---
-    if not os.path.exists(MODEL_PATH):
-        logging.error(f"模型文件未找到: {MODEL_PATH}")
+    logging.info(
+        f"评估模型: RecurrentAnatomyGATNew_A "
+        f"(Relations={NUM_RELATIONS}, Iterations={args.num_iterations}, use_visual={args.use_visual})"
+    )
+    logging.info(f"测试数据文件: {args.test_data_path}")
+    logging.info(
+        f"后处理参数: relabel_margin={args.relabel_margin}, "
+        f"relabel_min_prob={args.relabel_min_prob}, duplicate_iou={args.duplicate_iou_threshold}"
+    )
+
+    if not os.path.exists(args.model_path):
+        logging.error(f"模型文件未找到: {args.model_path}")
         return
 
-    # [!! 关键 !!] 实例化时传入 num_iterations
-    model = RecurrentAnatomyGATNew(
-        n_classes=N_CLASSES,
-        num_relations=NUM_RELATIONS,
-        num_iterations=NUM_ITERATIONS
-    ).to(DEVICE)
-    # model = RecurrentAnatomyGATNew_A(n_classes=N_CLASSES,num_relations=4,num_iterations=1,use_prior = True,use_edge_features=False,spatial_only=True).to(DEVICE)
+    model = build_model(args)
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-        logging.info(f"模型权重已加载: {MODEL_PATH}")
+        state = torch.load(args.model_path, map_location=DEVICE)
+        if isinstance(state, dict) and 'state_dict' in state:
+            state = state['state_dict']
+        model.load_state_dict(state)
+        logging.info(f"模型权重已加载: {args.model_path}")
     except Exception as e:
         logging.error(f"加载权重失败: {e}")
         return
 
-    # --- 2. 加载数据 ---
     try:
-        test_data_list = torch.load(TEST_DATA_PATH, map_location='cpu', weights_only=False)
+        test_data_list = torch.load(args.test_data_path, map_location='cpu', weights_only=False)
         logging.info(f"测试数据已加载: {len(test_data_list)} 张图")
     except Exception as e:
-        logging.error(f"数据加载失败: {e}");
+        logging.error(f"数据加载失败: {e}")
         return
 
-    test_loader = DataLoader(test_data_list, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_data_list, batch_size=args.batch_size, shuffle=False)
 
-    # --- 3. 执行评估 ---
-    # --- 3. 执行批量评估 ---
-    # [!! 修改 !!] 接收 5 个返回值
     y_true, pred_original, pred_gnn, fps, latency = evaluate_aggregate(
-        model, test_loader, DEVICE, N_CLASSES
+        model, test_loader, DEVICE, args
     )
 
-    # --- 4. 计算指标 ---
     logging.info("\n--- 计算核心指标 ---")
     metrics_orig = calculate_metrics(y_true, pred_original, CONFUSION_SET_CLASSES)
     metrics_gnn = calculate_metrics(y_true, pred_gnn, CONFUSION_SET_CLASSES)
 
-    logging.info("\n" + "=" * 60)
-    logging.info(f"{'指标':<20} | {'Baseline':<15} | {'AnatomyGAT':<15}")
-    logging.info("-" * 60)
-    logging.info(f"{'总体准确率':<20} | {metrics_orig[0]:.4f}          | {metrics_gnn[0]:.4f}")
-    logging.info(f"{'混淆集准确率':<20} | {metrics_orig[1]:.4f}          | {metrics_gnn[1]:.4f}")
-    # [!! 新增 !!] 打印速度
-    logging.info("-" * 60)
-    logging.info(f"{'推理速度 (FPS)':<20} | {'-':<15} | {fps:.2f}")
-    logging.info(f"{'单张延迟 (ms)':<20} | {'-':<15} | {latency:.2f}")
-    logging.info("=" * 60 + "\n")
+    logging.info("\n" + "=" * 70)
+    logging.info(f"{'指标':<24} | {'Detector':<15} | {'GNN corrected':<15}")
+    logging.info("-" * 70)
+    logging.info(f"{'总体准确率':<24} | {metrics_orig[0]:.4f}          | {metrics_gnn[0]:.4f}")
+    logging.info(f"{'混淆集准确率':<24} | {metrics_orig[1]:.4f}          | {metrics_gnn[1]:.4f}")
+    logging.info("-" * 70)
+    logging.info(f"{'推理速度 (FPS)':<24} | {'-':<15} | {fps:.2f}")
+    logging.info(f"{'单张延迟 (ms)':<24} | {'-':<15} | {latency:.2f}")
+    logging.info("=" * 70 + "\n")
 
-    # --- 5. 生成详细报告 ---
     simple_class_names = [str(i) for i in range(N_CLASSES)]
-
     report_gnn = classification_report(y_true, pred_gnn, target_names=simple_class_names, zero_division=0)
     logging.info("RecurrentGAT 分类报告预览:\n" + report_gnn)
 
-    with open(os.path.join(RESULTS_SAVE_DIR, 'classification_report_recurrent.txt'), 'w') as f:
+    with open(os.path.join(results_save_dir, 'classification_report_recurrent.txt'), 'w') as f:
         f.write(report_gnn)
 
-    # --- 6. 绘制混淆矩阵 ---
     plot_confusion_matrix(
         y_true, pred_gnn, simple_class_names,
-        f'Confusion Matrix - RecurrentGAT (T={NUM_ITERATIONS})',
-        os.path.join(RESULTS_SAVE_DIR, 'cm_recurrent_gat.png')
+        f'Confusion Matrix - RecurrentGAT Corrector (T={args.num_iterations})',
+        os.path.join(results_save_dir, 'cm_recurrent_gat.png')
     )
 
-    # --- 7. 生成逐图预测文件 ---
-    save_pt_path = os.path.join(RESULTS_SAVE_DIR, 'graph_by_graph_predictions_recurrent_ccsw_60data_i5_r2.pt')
-    generate_per_graph_predictions(model, test_data_list, DEVICE, N_CLASSES, save_pt_path)
+    save_pt_path = os.path.join(results_save_dir, args.output_name)
+    generate_per_graph_predictions(model, test_data_list, DEVICE, save_pt_path, args)
 
     logging.info("迭代模型评估结束。")
 
