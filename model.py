@@ -907,8 +907,8 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
         torch.nn.init.zeros_(self.structural_bias.weight)
         self.detector_prior_smoothing = 0.18
         self.detector_logit_temperature = 2.0
-        self.struct_prior_scale = 0.55
-        self.register_buffer("slot_fusion_floor", torch.tensor([[0.25, 0.15, 0.15]], dtype=torch.float))
+        self.struct_prior_scale = 0.75
+        self.register_buffer("slot_fusion_floor", torch.tensor([[0.20, 0.20, 0.25]], dtype=torch.float))
         self.slot_fusion_gate = torch.nn.Sequential(
             torch.nn.Linear(self.fused_dim + self.background_idx + self.background_idx, 128),
             torch.nn.ReLU(),

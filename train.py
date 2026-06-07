@@ -15,7 +15,7 @@ BACKGROUND_IDX = 48
 NUM_RELATIONS = 5
 DEFAULT_TRAIN_DATA = "gnn_data/train_sin_arch4_edge_01_slot_struct_order.pt"
 DEFAULT_VAL_DATA = "gnn_data/val_sin_arch4_edge_01_slot_struct_order.pt"
-DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructOrder_NoVisual_T5"
+DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_structfused"
 
 CLASS_NAMES = [
     "11", "12", "13", "14", "15", "16", "17",
@@ -240,9 +240,15 @@ class SlotQualityCriterion(torch.nn.Module):
                 competitor_prior[:, 1],
                 competitor_prior[:, 0],
             )
+            struct_supports_target = target_prior + 0.20 >= best_other_prior
+            slot_prior_ce = F.cross_entropy(slot_logits, safe_slot_target, reduction="none")
             slot_prior_margin = weighted_mean(
-                F.relu(0.15 - target_prior + best_other_prior),
-                slot_valid.float(),
+                slot_prior_ce,
+                slot_valid.float() * struct_supports_target.float() * torch.where(
+                    raw_wrong,
+                    torch.full_like(detector_scores, 2.0),
+                    torch.full_like(detector_scores, 0.6),
+                ),
             )
             raw_struct_score = raw_prior
 
@@ -289,15 +295,15 @@ class SlotQualityCriterion(torch.nn.Module):
 
         total = (
             slot_loss
-            + 0.35 * relational_loss
+            + 0.20 * relational_loss
             + 0.55 * quality_loss
             + 0.10 * keep_margin
             + 0.30 * correction_margin
             + 0.08 * cross_dentition_penalty
             + 0.05 * cross_dentition_correction_margin
             + 0.05 * quality_margin
-            + 0.08 * background_confidence_loss
-            + 0.03 * slot_prior_margin
+            + 0.12 * background_confidence_loss
+            + 0.06 * slot_prior_margin
             + 0.06 * pairwise_order_loss
             + 0.08 * overcorrection_loss
         )
@@ -573,6 +579,12 @@ def main():
         geom_dim=args.geom_dim,
         edge_attr_dim=args.edge_attr_dim,
     ).to(device)
+    logging.info(
+        f"fusion_config: floor={model.slot_fusion_floor.detach().cpu().tolist()}, "
+        f"struct_prior_scale={model.struct_prior_scale}, "
+        f"detector_prior_smoothing={model.detector_prior_smoothing}, "
+        f"detector_logit_temperature={model.detector_logit_temperature}"
+    )
     criterion = SlotQualityCriterion()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

@@ -17,7 +17,7 @@ from model import SlotQualityRecurrentAnatomyGAT
 N_CLASSES = 49
 BACKGROUND_IDX = 48
 NUM_RELATIONS = 5
-DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_unfreeze/best_model.pth"
+DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_structfused/best_model.pth"
 DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot_struct_order.pt"
 DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_struct_order_t5_exp_open.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
