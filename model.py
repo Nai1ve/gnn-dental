@@ -903,6 +903,14 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             torch.nn.Dropout(0.3),
             torch.nn.Linear(128, 2)
         )
+        self.score_delta_head = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 64),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(64, 1)
+        )
+        torch.nn.init.zeros_(self.score_delta_head[-1].weight)
+        torch.nn.init.zeros_(self.score_delta_head[-1].bias)
         self.structural_bias = torch.nn.Linear(geom_dim, self.background_idx, bias=False)
         torch.nn.init.zeros_(self.structural_bias.weight)
         self.detector_prior_smoothing = 0.18
@@ -1047,12 +1055,14 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
                 + fusion_weights[:, 2:3] * struct_logits
             )
             quality_logits = self.quality_head(h_2)
+            score_delta = self.score_delta_head(h_2).squeeze(-1)
             all_step_outputs.append({
                 "slot_logits": slot_logits,
                 "relational_logits": relational_logits,
                 "detector_slot_logits": detector_slot_logits,
                 "struct_logits": struct_logits,
                 "quality_logits": quality_logits,
+                "score_delta": score_delta,
                 "fusion_weights": fusion_weights,
             })
 

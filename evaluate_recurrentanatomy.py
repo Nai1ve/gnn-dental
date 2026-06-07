@@ -17,7 +17,7 @@ from model import SlotQualityRecurrentAnatomyGAT
 N_CLASSES = 49
 BACKGROUND_IDX = 48
 NUM_RELATIONS = 5
-DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_structfused/best_model.pth"
+DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_APAware/best_model.pth"
 DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot_struct_order.pt"
 DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_struct_order_t5_exp_open.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -61,9 +61,12 @@ def parse_args():
     parser.add_argument("--duplicate-ios-threshold", type=float, default=0.70)
     parser.add_argument(
         "--score-calibration",
-        choices=("raw", "gnn_delta"),
-        default="raw",
-        help="raw keeps detector scores except soft suppression; gnn_delta applies the older light GNN probability multiplier.",
+        choices=("raw", "gnn_delta", "ap_aware"),
+        default="ap_aware",
+        help=(
+            "raw keeps detector scores except soft suppression; gnn_delta applies the older light GNN probability multiplier; "
+            "ap_aware uses the learned score_delta head for COCO ranking calibration."
+        ),
     )
     parser.add_argument(
         "--duplicate-action",
@@ -274,6 +277,7 @@ def duplicate_cleanup(
     duplicate_action="low_score",
     quality_probs=None,
     slot_prior=None,
+    score_delta=None,
 ):
     labels = labels.clone()
     duplicate_mask = torch.zeros_like(labels, dtype=torch.bool)
@@ -289,6 +293,8 @@ def duplicate_cleanup(
         slot_prior = slot_prior.to(labels.device)
         slot_score = slot_prior.gather(1, safe_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
         keep_score = keep_score + 0.12 * slot_score.clamp(-2.0, 2.0)
+    if score_delta is not None:
+        keep_score = keep_score + 0.18 * torch.tanh(score_delta.to(labels.device)).clamp(-1.0, 1.0)
 
     for cls_idx in range(BACKGROUND_IDX):
         cls_indices = torch.where(labels == cls_idx)[0]
@@ -345,6 +351,7 @@ def calibrate_scores(
     detector_scores,
     final_labels,
     class_probs,
+    score_delta=None,
     duplicate_mask=None,
     score_calibration="raw",
     duplicate_action="low_score",
@@ -360,7 +367,12 @@ def calibrate_scores(
     label_probs = class_probs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
     bg_probs = class_probs[:, BACKGROUND_IDX]
 
-    if score_calibration == "gnn_delta":
+    if score_calibration == "ap_aware" and score_delta is not None:
+        learned_delta = torch.tanh(score_delta).clamp(-1.0, 1.0)
+        prob_delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
+        multiplier = (1.0 + 0.18 * learned_delta + 0.04 * prob_delta).clamp(0.72, 1.12)
+        calibrated = (detector_scores * multiplier).clamp(0, 1)
+    elif score_calibration == "gnn_delta":
         delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
         multiplier = (1.0 + 0.12 * delta).clamp(0.88, 1.12)
         calibrated = (detector_scores * multiplier).clamp(0, 1)
@@ -421,6 +433,7 @@ def postprocess_graph(step_output, graph, args):
         duplicate_action=args.duplicate_action,
         quality_probs=quality_probs,
         slot_prior=slot_prior.to(class_logits.device) if slot_prior is not None else None,
+        score_delta=step_output.get("score_delta"),
     )
     postprocessed, relabel_mask, cross_dentition_guard_mask = apply_cross_dentition_guard(
         postprocessed,
@@ -434,6 +447,7 @@ def postprocess_graph(step_output, graph, args):
         detector_scores,
         postprocessed,
         base_probs,
+        step_output.get("score_delta"),
         duplicate_mask,
         args.score_calibration,
         args.duplicate_action,
@@ -489,6 +503,8 @@ def evaluate_aggregate(model, loader, device, args):
                 "slot_logits": last_steps["slot_logits"][node_offset:node_offset + num_nodes],
                 "quality_logits": last_steps["quality_logits"][node_offset:node_offset + num_nodes],
             }
+            if "score_delta" in last_steps:
+                single_step["score_delta"] = last_steps["score_delta"][node_offset:node_offset + num_nodes]
             processed = postprocess_graph(single_step, graph, args)
             all_y_true.append(graph.y.long().cpu().numpy())
             all_pred_original.append(processed["pred_original"].numpy())
@@ -537,6 +553,8 @@ def generate_per_graph_predictions(model, test_data_list, device, save_path, arg
                 "slot_logits": step_output["slot_logits"][node_offset:node_offset + num_nodes],
                 "quality_logits": step_output["quality_logits"][node_offset:node_offset + num_nodes],
             }
+            if "score_delta" in step_output:
+                single_step["score_delta"] = step_output["score_delta"][node_offset:node_offset + num_nodes]
             processed = postprocess_graph(single_step, graph, args)
             all_graph_results.append({
                 "img_id": get_scalar(getattr(graph, "img_id", None)),
@@ -552,6 +570,7 @@ def generate_per_graph_predictions(model, test_data_list, device, save_path, arg
                 "pred_scores_gnn": processed["pred_scores_gnn"],
                 "gnn_logits": processed["gnn_logits"],
                 "gnn_probs": processed["gnn_probs"],
+                "score_delta": single_step.get("score_delta", torch.empty((num_nodes,), device=step_output["slot_logits"].device)).detach().cpu(),
                 "fusion_weights": step_output.get("fusion_weights", torch.empty((num_nodes, 3), device=step_output["slot_logits"].device))[node_offset:node_offset + num_nodes].detach().cpu(),
                 "relabel_mask": processed["relabel_mask"],
                 "duplicate_suppressed_mask": processed["duplicate_suppressed_mask"],
@@ -625,7 +644,13 @@ def main():
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     load_result = model.load_state_dict(state, strict=False)
-    allowed_missing = {"slot_fusion_floor"}
+    allowed_missing = {
+        "slot_fusion_floor",
+        "score_delta_head.0.weight",
+        "score_delta_head.0.bias",
+        "score_delta_head.3.weight",
+        "score_delta_head.3.bias",
+    }
     missing = [key for key in load_result.missing_keys if key not in allowed_missing]
     if missing or load_result.unexpected_keys:
         raise RuntimeError(
