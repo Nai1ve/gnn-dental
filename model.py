@@ -840,7 +840,7 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
     def __init__(self, n_classes=49, num_relations=4, num_iterations=5,
                  use_visual=False, use_geom=True, use_prior=True,
                  use_edge_features=True, spatial_only=False,
-                 geom_dim=29, edge_attr_dim=11):
+                 geom_dim=37, edge_attr_dim=16):
         super().__init__()
         self.n_classes = n_classes
         self.background_idx = n_classes - 1
@@ -903,6 +903,14 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             torch.nn.Dropout(0.3),
             torch.nn.Linear(128, 2)
         )
+        self.structural_bias = torch.nn.Linear(geom_dim, self.background_idx, bias=False)
+        torch.nn.init.zeros_(self.structural_bias.weight)
+        self.structural_bias_scale = 0.15
+        self.belief_gate = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 1),
+        )
 
     def _align_edge_attr(self, edge_attr):
         expected_dim = self.edge_encoder[0].in_features
@@ -954,6 +962,9 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
         h_geom = self.geom_encoder(data.x_geom)
         if not self.use_geom:
             h_geom = torch.zeros_like(h_geom)
+            structural_slot_bias = torch.zeros((data.x_geom.size(0), self.background_idx), device=device)
+        else:
+            structural_slot_bias = self.structural_bias(data.x_geom)
 
         original_prior = data.x_prior.to(device)
         if not self.use_prior:
@@ -985,7 +996,7 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             h_2 = F.elu(h_2) + h_1
             h_2 = self.norm_2(h_2)
 
-            slot_logits = self.slot_head(h_2)
+            slot_logits = self.slot_head(h_2) + self.structural_bias_scale * structural_slot_bias
             quality_logits = self.quality_head(h_2)
             all_step_outputs.append({
                 "slot_logits": slot_logits,
@@ -997,7 +1008,9 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
                 quality_probs = F.softmax(quality_logits, dim=1)
                 bg_prob = quality_probs[:, :1]
                 confidence, _ = torch.max(slot_probs, dim=1, keepdim=True)
-                current_dynamic_belief = torch.cat([slot_probs, bg_prob, confidence], dim=1)
+                candidate_belief = torch.cat([slot_probs, bg_prob, confidence], dim=1)
+                update_gate = 0.65 * torch.sigmoid(self.belief_gate(h_2))
+                current_dynamic_belief = (1.0 - update_gate) * original_prior + update_gate * candidate_belief
 
         if return_att:
             return all_step_outputs, final_attention_weights, edge_index, edge_type

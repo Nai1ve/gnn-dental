@@ -17,10 +17,22 @@ from model import SlotQualityRecurrentAnatomyGAT
 N_CLASSES = 49
 BACKGROUND_IDX = 48
 NUM_RELATIONS = 4
-DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_NoVisual_Edge_Geom_Prior_T5/best_model.pth"
-DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot.pt"
-DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_t5_exp_open.pt"
+DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructPrior_NoVisual_Edge_Geom_Prior_T5/best_model.pth"
+DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot_struct.pt"
+DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_struct_t5_exp_open.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CLASS_NAMES = [
+    "11", "12", "13", "14", "15", "16", "17",
+    "21", "22", "23", "24", "25", "26", "27",
+    "31", "32", "33", "34", "35", "36", "37",
+    "41", "42", "43", "44", "45", "46", "47",
+    "51", "52", "53", "54", "55",
+    "61", "62", "63", "64", "65",
+    "71", "72", "73", "74", "75",
+    "81", "82", "83", "84", "85",
+]
+DENTITION_GROUPS = tuple(1 if int(name) // 10 >= 5 else 0 for name in CLASS_NAMES) + (2,)
 
 CONFUSION_SET_CLASSES = {
     11, 12, 21, 22, 31, 32, 41, 42,
@@ -35,8 +47,8 @@ def parse_args():
     parser.add_argument("--output-name", default=DEFAULT_OUTPUT_NAME)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-iterations", type=int, default=5)
-    parser.add_argument("--geom-dim", type=int, default=29)
-    parser.add_argument("--edge-attr-dim", type=int, default=11)
+    parser.add_argument("--geom-dim", type=int, default=37)
+    parser.add_argument("--edge-attr-dim", type=int, default=16)
     parser.add_argument("--relabel-margin", type=float, default=0.06)
     parser.add_argument("--relabel-min-prob", type=float, default=0.20)
     parser.add_argument("--duplicate-iou-threshold", type=float, default=0.50)
@@ -60,10 +72,12 @@ def parse_args():
     parser.add_argument("--duplicate-score-cap", type=float, default=0.19)
     parser.add_argument("--duplicate-score-multiplier", type=float, default=0.35)
     parser.add_argument("--disable-background-soft-suppression", action="store_true")
-    parser.add_argument("--background-prob-threshold", type=float, default=0.70)
+    parser.add_argument("--background-prob-threshold", type=float, default=0.40)
     parser.add_argument("--background-detector-score-threshold", type=float, default=0.40)
     parser.add_argument("--background-score-cap", type=float, default=0.19)
     parser.add_argument("--background-score-multiplier", type=float, default=0.35)
+    parser.add_argument("--disable-cross-dentition-guard", action="store_true")
+    parser.add_argument("--cross-dentition-guard-score-threshold", type=float, default=0.80)
     parser.add_argument(
         "--save-attention",
         action="store_true",
@@ -108,6 +122,11 @@ def get_raw_boxes(graph):
     if hasattr(graph, "pred_bboxes_raw"):
         return graph.pred_bboxes_raw.float()
     return graph.pos.float()
+
+
+def get_dentition_groups(labels):
+    lookup = torch.as_tensor(DENTITION_GROUPS, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
 
 
 def get_scalar(value, default=-1):
@@ -212,6 +231,35 @@ def duplicate_cleanup(
     return labels, duplicate_mask
 
 
+def apply_cross_dentition_guard(
+    labels,
+    raw_labels,
+    detector_scores,
+    relabel_mask,
+    enabled=True,
+    score_threshold=0.80,
+):
+    labels = labels.clone()
+    guard_mask = torch.zeros_like(labels, dtype=torch.bool)
+    if not enabled or labels.numel() == 0:
+        return labels, relabel_mask, guard_mask
+
+    raw_dentition = get_dentition_groups(raw_labels)
+    pred_dentition = get_dentition_groups(labels)
+    guard_mask = (
+        relabel_mask
+        & (raw_labels != BACKGROUND_IDX)
+        & (labels != BACKGROUND_IDX)
+        & (raw_dentition != pred_dentition)
+        & (detector_scores >= float(score_threshold))
+    )
+    if guard_mask.any():
+        labels[guard_mask] = raw_labels[guard_mask]
+        relabel_mask = relabel_mask.clone()
+        relabel_mask[guard_mask] = False
+    return labels, relabel_mask, guard_mask
+
+
 def calibrate_scores(
     detector_scores,
     final_labels,
@@ -222,7 +270,7 @@ def calibrate_scores(
     duplicate_score_cap=0.19,
     duplicate_score_multiplier=0.35,
     background_soft_suppression=True,
-    background_prob_threshold=0.70,
+    background_prob_threshold=0.40,
     background_detector_score_threshold=0.40,
     background_score_cap=0.19,
     background_score_multiplier=0.35,
@@ -281,6 +329,14 @@ def postprocess_graph(step_output, graph, args):
         args.duplicate_ios_threshold,
         args.duplicate_action,
     )
+    postprocessed, relabel_mask, cross_dentition_guard_mask = apply_cross_dentition_guard(
+        postprocessed,
+        raw_labels,
+        detector_scores,
+        relabel_mask,
+        not args.disable_cross_dentition_guard,
+        args.cross_dentition_guard_score_threshold,
+    )
     calibrated_scores, background_soft_mask = calibrate_scores(
         detector_scores,
         postprocessed,
@@ -306,6 +362,7 @@ def postprocess_graph(step_output, graph, args):
         "relabel_mask": relabel_mask.detach().cpu(),
         "duplicate_suppressed_mask": duplicate_mask.detach().cpu(),
         "background_soft_suppressed_mask": background_soft_mask.detach().cpu(),
+        "cross_dentition_guard_mask": cross_dentition_guard_mask.detach().cpu(),
     }
 
 
@@ -316,6 +373,7 @@ def evaluate_aggregate(model, loader, device, args):
     relabel_total = 0
     duplicate_suppressed_total = 0
     background_soft_suppressed_total = 0
+    cross_dentition_guard_total = 0
     total_inference_time = 0.0
     total_graphs = 0
 
@@ -345,6 +403,7 @@ def evaluate_aggregate(model, loader, device, args):
             relabel_total += int(processed["relabel_mask"].sum())
             duplicate_suppressed_total += int(processed["duplicate_suppressed_mask"].sum())
             background_soft_suppressed_total += int(processed["background_soft_suppressed_mask"].sum())
+            cross_dentition_guard_total += int(processed["cross_dentition_guard_mask"].sum())
             node_offset += num_nodes
 
     avg_latency_ms = (total_inference_time / total_graphs) * 1000 if total_graphs else 0.0
@@ -353,7 +412,8 @@ def evaluate_aggregate(model, loader, device, args):
     logging.info(f"total={total_inference_time:.4f}s, graphs={total_graphs}, latency={avg_latency_ms:.4f}ms, fps={fps:.2f}")
     logging.info(
         f"relabel nodes={relabel_total}, duplicate suppressed nodes={duplicate_suppressed_total}, "
-        f"background soft-suppressed nodes={background_soft_suppressed_total}"
+        f"background soft-suppressed nodes={background_soft_suppressed_total}, "
+        f"cross-dentition guarded nodes={cross_dentition_guard_total}"
     )
     return (
         np.concatenate(all_y_true),
@@ -402,6 +462,7 @@ def generate_per_graph_predictions(model, test_data_list, device, save_path, arg
                 "relabel_mask": processed["relabel_mask"],
                 "duplicate_suppressed_mask": processed["duplicate_suppressed_mask"],
                 "background_soft_suppressed_mask": processed["background_soft_suppressed_mask"],
+                "cross_dentition_guard_mask": processed["cross_dentition_guard_mask"],
                 "edge_index": edge_index.cpu().numpy() if edge_index is not None else None,
                 "att_weights": att_weights.cpu().numpy() if att_weights is not None else None,
                 "edge_types": edge_type.cpu().numpy() if edge_type is not None else None,
@@ -453,7 +514,9 @@ def main():
         f"score_calibration={args.score_calibration}, "
         f"background_soft_suppression={not args.disable_background_soft_suppression}, "
         f"background_prob_threshold={args.background_prob_threshold}, "
-        f"background_detector_score_threshold={args.background_detector_score_threshold}"
+        f"background_detector_score_threshold={args.background_detector_score_threshold}, "
+        f"cross_dentition_guard={not args.disable_cross_dentition_guard}, "
+        f"cross_dentition_guard_score_threshold={args.cross_dentition_guard_score_threshold}"
     )
 
     if not os.path.exists(args.model_path):

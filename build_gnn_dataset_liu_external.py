@@ -29,6 +29,19 @@ CLASS_NAMES = [
 BACKGROUND = len(CLASS_NAMES)
 N_CLASSES = BACKGROUND + 1
 EPS = 1e-6
+DENTITION_GROUPS = np.asarray([1 if int(name) // 10 >= 5 else 0 for name in CLASS_NAMES] + [2], dtype=np.int64)
+JAW_GROUPS = np.asarray([0 if int(name) // 10 in (1, 2, 5, 6) else 1 for name in CLASS_NAMES] + [2], dtype=np.int64)
+SIDE_GROUPS = np.asarray([0 if int(name) // 10 in (1, 4, 5, 8) else 1 for name in CLASS_NAMES] + [2], dtype=np.int64)
+TOOTH_ORDER = np.asarray([
+    (int(name) % 10 - 1) / (4.0 if int(name) // 10 >= 5 else 6.0)
+    for name in CLASS_NAMES
+] + [0.0], dtype=np.float32)
+TOOTH_INDEX = np.asarray([int(name) % 10 for name in CLASS_NAMES] + [0], dtype=np.int64)
+EXPECTED_JAW_RANK = np.asarray([
+    (1.0 if int(name) // 10 in (2, 3, 6, 7) else -1.0)
+    * ((int(name) % 10 - 1) / (4.0 if int(name) // 10 >= 5 else 6.0))
+    for name in CLASS_NAMES
+] + [0.0], dtype=np.float32)
 
 
 def is_missing_feature(value) -> bool:
@@ -146,6 +159,37 @@ def fourier_encode(x: torch.Tensor, num_bands: int = 4) -> torch.Tensor:
     freqs = torch.pow(2, torch.arange(num_bands, dtype=torch.float, device=x.device))
     x_freq = x * freqs * torch.pi
     return torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1)
+
+
+def label_structure_features(labels: torch.Tensor, is_upper: torch.Tensor, is_left: torch.Tensor, rank_jaw: torch.Tensor):
+    safe_labels = labels.clamp(0, BACKGROUND)
+    device = labels.device
+    dentition = torch.as_tensor(DENTITION_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    jaw = torch.as_tensor(JAW_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    side = torch.as_tensor(SIDE_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    tooth_order = torch.as_tensor(TOOTH_ORDER, dtype=torch.float, device=device)[safe_labels]
+    expected_jaw_rank = torch.as_tensor(EXPECTED_JAW_RANK, dtype=torch.float, device=device)[safe_labels]
+
+    raw_is_upper = jaw == 0
+    raw_is_left = side == 0
+    valid_tooth = safe_labels < BACKGROUND
+    dentition_sign = torch.where(dentition == 1, torch.ones_like(tooth_order), -torch.ones_like(tooth_order))
+    jaw_sign = torch.where(raw_is_upper, -torch.ones_like(tooth_order), torch.ones_like(tooth_order))
+    side_sign = torch.where(raw_is_left, -torch.ones_like(tooth_order), torch.ones_like(tooth_order))
+    jaw_match = ((raw_is_upper == is_upper) & valid_tooth).float()
+    side_match = ((raw_is_left == is_left) & valid_tooth).float()
+    order_rank_delta = (expected_jaw_rank - rank_jaw).clamp(-2.0, 2.0) / 2.0
+    valid_float = valid_tooth.float()
+    return torch.stack([
+        dentition_sign,
+        jaw_sign,
+        side_sign,
+        tooth_order * 2.0 - 1.0,
+        jaw_match * 2.0 - 1.0,
+        side_match * 2.0 - 1.0,
+        order_rank_delta,
+        valid_float,
+    ], dim=1).float()
 
 
 def calculate_iou_np(box_a, box_b) -> float:
@@ -328,6 +372,7 @@ def compute_edge_attributes(
     edge_index: torch.Tensor,
     boxes: torch.Tensor,
     centers: torch.Tensor,
+    labels: torch.Tensor,
     img_w: float,
     img_h: float,
     iou_matrix: torch.Tensor,
@@ -337,7 +382,7 @@ def compute_edge_attributes(
     rank_jaw: torch.Tensor,
 ):
     if edge_index.numel() == 0:
-        return torch.empty((0, 11), dtype=torch.float, device=boxes.device)
+        return torch.empty((0, 16), dtype=torch.float, device=boxes.device)
     src, dst = edge_index[0], edge_index[1]
     dx = (centers[dst, 0] - centers[src, 0]) / max(img_w, EPS)
     dy = (centers[dst, 1] - centers[src, 1]) / max(img_h, EPS)
@@ -350,6 +395,20 @@ def compute_edge_attributes(
     same_side = (is_left[src] == is_left[dst]).float()
     rank_delta = (rank_jaw[dst] - rank_jaw[src]).clamp(-2.0, 2.0) / 2.0
     direction_sign = torch.sign(dx)
+    safe_labels = labels.clamp(0, BACKGROUND)
+    device = labels.device
+    dentition = torch.as_tensor(DENTITION_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    label_jaw = torch.as_tensor(JAW_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    label_side = torch.as_tensor(SIDE_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    label_order = torch.as_tensor(TOOTH_ORDER, dtype=torch.float, device=device)[safe_labels]
+    label_index = torch.as_tensor(TOOTH_INDEX, dtype=torch.long, device=device)[safe_labels]
+    valid_pair = ((safe_labels[src] < BACKGROUND) & (safe_labels[dst] < BACKGROUND)).float()
+    same_dentition_label = ((dentition[src] == dentition[dst]).float() * valid_pair)
+    same_jaw_label = ((label_jaw[src] == label_jaw[dst]).float() * valid_pair)
+    same_side_label = ((label_side[src] == label_side[dst]).float() * valid_pair)
+    order_delta_label = ((label_order[dst] - label_order[src]).clamp(-1.0, 1.0) * valid_pair)
+    adjacent_label = ((torch.abs(label_index[dst] - label_index[src]) == 1).float()
+                      * same_dentition_label * same_jaw_label * same_side_label)
     return torch.stack([
         dx,
         dy,
@@ -362,6 +421,11 @@ def compute_edge_attributes(
         same_side,
         rank_delta,
         direction_sign,
+        same_dentition_label,
+        same_jaw_label,
+        same_side_label,
+        order_delta_label,
+        adjacent_label,
     ], dim=1).float()
 
 
@@ -425,6 +489,7 @@ def build_graph_from_features(
     enc_dy = fourier_encode((centers_y - centroid[1]) / max(img_h, EPS), num_bands=4)
     rel_coord = torch.cat([enc_dx, enc_dy], dim=1)
     node_space, is_upper, is_left, rank_jaw = jaw_side_rank_features(centers, img_w, img_h)
+    label_space = label_structure_features(labels, is_upper, is_left, rank_jaw)
 
     geom_features = []
     for i in range(boxes.size(0)):
@@ -439,7 +504,7 @@ def build_graph_from_features(
             ((w * h) / (img_w * img_h)) * 2 - 1,
             math.log((w / h).item()),
         ], dtype=torch.float)
-        geom_features.append(torch.cat([base, rel_coord[i], node_space[i]], dim=0))
+        geom_features.append(torch.cat([base, rel_coord[i], node_space[i], label_space[i]], dim=0))
     x_geom = torch.stack(geom_features).float()
 
     x_visual = torch.zeros((boxes.size(0), visual_dim), dtype=torch.float)
@@ -456,10 +521,10 @@ def build_graph_from_features(
         x_penalty=5.0,
     )
 
-    edge_attr_overlap = compute_edge_attributes(edge_overlap, boxes, centers, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
-    edge_attr_arch = compute_edge_attributes(edge_arch, boxes, centers, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
-    edge_attr_vertical = compute_edge_attributes(edge_vertical, boxes, centers, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
-    edge_attr_spatial = compute_edge_attributes(edge_spatial, boxes, centers, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_overlap = compute_edge_attributes(edge_overlap, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_arch = compute_edge_attributes(edge_arch, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_vertical = compute_edge_attributes(edge_vertical, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_spatial = compute_edge_attributes(edge_spatial, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
 
     pos_normalized = torch.stack([
         (centers[:, 0] / img_w) * 2 - 1,
@@ -490,6 +555,10 @@ def build_graph_from_features(
         pred_bboxes_raw=boxes,
         pred_scores_raw=scores,
         pred_labels_raw=labels,
+        pred_label_dentition=torch.as_tensor(DENTITION_GROUPS, dtype=torch.long)[labels.clamp(0, BACKGROUND)],
+        pred_label_jaw=torch.as_tensor(JAW_GROUPS, dtype=torch.long)[labels.clamp(0, BACKGROUND)],
+        pred_label_side=torch.as_tensor(SIDE_GROUPS, dtype=torch.long)[labels.clamp(0, BACKGROUND)],
+        pred_label_order=torch.as_tensor(TOOTH_ORDER, dtype=torch.float)[labels.clamp(0, BACKGROUND)],
         used_fallback_prior=used_fallback_prior,
         visual_missing=True,
     )

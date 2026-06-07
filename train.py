@@ -13,9 +13,21 @@ from model import SlotQualityRecurrentAnatomyGAT
 N_CLASSES = 49
 BACKGROUND_IDX = 48
 NUM_RELATIONS = 4
-DEFAULT_TRAIN_DATA = "gnn_data/train_sin_arch4_edge_01_slot.pt"
-DEFAULT_VAL_DATA = "gnn_data/val_sin_arch4_edge_01_slot.pt"
-DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_NoVisual_Edge_Geom_Prior_T5"
+DEFAULT_TRAIN_DATA = "gnn_data/train_sin_arch4_edge_01_slot_struct.pt"
+DEFAULT_VAL_DATA = "gnn_data/val_sin_arch4_edge_01_slot_struct.pt"
+DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructPrior_NoVisual_Edge_Geom_Prior_T5"
+
+CLASS_NAMES = [
+    "11", "12", "13", "14", "15", "16", "17",
+    "21", "22", "23", "24", "25", "26", "27",
+    "31", "32", "33", "34", "35", "36", "37",
+    "41", "42", "43", "44", "45", "46", "47",
+    "51", "52", "53", "54", "55",
+    "61", "62", "63", "64", "65",
+    "71", "72", "73", "74", "75",
+    "81", "82", "83", "84", "85",
+]
+DENTITION_GROUPS = tuple(1 if int(name) // 10 >= 5 else 0 for name in CLASS_NAMES) + (2,)
 
 CONFUSION_SET_CLASSES = {
     11, 12, 21, 22, 31, 32, 41, 42,
@@ -34,8 +46,8 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--patience", type=int, default=24)
     parser.add_argument("--num-iterations", type=int, default=5)
-    parser.add_argument("--geom-dim", type=int, default=29)
-    parser.add_argument("--edge-attr-dim", type=int, default=11)
+    parser.add_argument("--geom-dim", type=int, default=37)
+    parser.add_argument("--edge-attr-dim", type=int, default=16)
     return parser.parse_args()
 
 
@@ -55,6 +67,17 @@ def get_quality_targets(batch):
     if hasattr(batch, "quality_y"):
         return batch.quality_y.long()
     return (batch.y.long() != BACKGROUND_IDX).long()
+
+
+def get_detector_scores(batch):
+    if hasattr(batch, "pred_scores_raw"):
+        return batch.pred_scores_raw.float().clamp(0, 1)
+    return ((batch.x_prior[:, -1].float() + 1.0) / 2.0).clamp(0, 1)
+
+
+def get_dentition_groups(labels):
+    lookup = torch.as_tensor(DENTITION_GROUPS, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
 
 
 def step_to_logits(step_output):
@@ -88,6 +111,7 @@ class SlotQualityCriterion(torch.nn.Module):
         slot_target = get_slot_targets(batch).to(slot_logits.device)
         quality_target = get_quality_targets(batch).to(slot_logits.device)
         raw_labels = get_raw_labels(batch).to(slot_logits.device)
+        detector_scores = get_detector_scores(batch).to(slot_logits.device)
 
         slot_valid = (slot_target >= 0) & (slot_target < BACKGROUND_IDX)
         safe_slot_target = slot_target.clamp(0, BACKGROUND_IDX - 1)
@@ -95,8 +119,10 @@ class SlotQualityCriterion(torch.nn.Module):
         slot_ce_all = F.cross_entropy(slot_logits, safe_slot_target, reduction="none")
         raw_correct = slot_valid & (raw_labels == safe_slot_target)
         raw_wrong = slot_valid & (raw_labels != safe_slot_target)
+        high_score_correct = raw_correct & (detector_scores >= 0.80)
         slot_weights = torch.zeros_like(slot_ce_all)
         slot_weights[raw_correct] = 1.2
+        slot_weights[high_score_correct] = 1.8
         slot_weights[raw_wrong] = 2.8
         slot_loss = weighted_mean(slot_ce_all, slot_weights) if slot_valid.any() else slot_ce_all.sum() * 0.0
 
@@ -105,8 +131,9 @@ class SlotQualityCriterion(torch.nn.Module):
         quality_weights[quality_target == 1] = 1.2
         if hasattr(batch, "node_role"):
             node_role = batch.node_role.to(slot_logits.device)
-            quality_weights[node_role == 1] = 0.8
-            quality_weights[node_role == 2] = 0.5
+            quality_weights[node_role == 1] = 1.0
+            quality_weights[node_role == 2] = 0.8
+            quality_weights[node_role == 3] = 0.7
         quality_loss = weighted_mean(quality_ce, quality_weights)
 
         keep_mask = raw_correct & (quality_target == 1)
@@ -116,6 +143,27 @@ class SlotQualityCriterion(torch.nn.Module):
         correction_mask = raw_wrong & (raw_labels < BACKGROUND_IDX)
         correction_margin = margin_loss(slot_logits, safe_slot_target, raw_labels.clamp(0, BACKGROUND_IDX - 1),
                                         correction_mask, margin=0.20)
+
+        raw_dentition = get_dentition_groups(raw_labels)
+        target_dentition = get_dentition_groups(safe_slot_target)
+        cross_dentition_wrong = raw_correct & (raw_labels < BACKGROUND_IDX)
+        cross_dentition_penalty = margin_loss(
+            slot_logits,
+            raw_labels.clamp(0, BACKGROUND_IDX - 1),
+            slot_logits[:, :BACKGROUND_IDX].argmax(dim=1),
+            cross_dentition_wrong
+            & (raw_dentition != get_dentition_groups(slot_logits[:, :BACKGROUND_IDX].argmax(dim=1)))
+            & (detector_scores >= 0.60),
+            margin=0.30,
+        )
+        cross_dentition_correction = correction_mask & (raw_dentition != target_dentition)
+        cross_dentition_correction_margin = margin_loss(
+            slot_logits,
+            safe_slot_target,
+            raw_labels.clamp(0, BACKGROUND_IDX - 1),
+            cross_dentition_correction,
+            margin=0.35,
+        )
 
         keep_vs_drop = F.relu(0.25 - quality_logits[:, 1] + quality_logits[:, 0])
         drop_vs_keep = F.relu(0.10 - quality_logits[:, 0] + quality_logits[:, 1])
@@ -129,6 +177,8 @@ class SlotQualityCriterion(torch.nn.Module):
             + 0.55 * quality_loss
             + 0.10 * keep_margin
             + 0.15 * correction_margin
+            + 0.08 * cross_dentition_penalty
+            + 0.05 * cross_dentition_correction_margin
             + 0.05 * quality_margin
         )
         parts = {
@@ -136,6 +186,8 @@ class SlotQualityCriterion(torch.nn.Module):
             "quality": quality_loss.detach(),
             "keep_margin": keep_margin.detach(),
             "correction_margin": correction_margin.detach(),
+            "cross_dentition": cross_dentition_penalty.detach(),
+            "cross_dentition_correction": cross_dentition_correction_margin.detach(),
             "quality_margin": quality_margin.detach(),
         }
         return total, parts
@@ -158,7 +210,16 @@ def conservative_relabel_for_validation(class_logits, raw_labels, margin=0.06, m
 
 def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
-    totals = {"loss": 0.0, "slot": 0.0, "quality": 0.0, "keep_margin": 0.0, "correction_margin": 0.0}
+    part_keys = [
+        "slot",
+        "quality",
+        "keep_margin",
+        "correction_margin",
+        "cross_dentition",
+        "cross_dentition_correction",
+        "quality_margin",
+    ]
+    totals = {"loss": 0.0, **{key: 0.0 for key in part_keys}}
     loss_weights = torch.tensor([0.2, 0.35, 0.5, 0.75, 1.0], device=device)
 
     for batch in loader:
@@ -183,7 +244,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
         scale = batch.num_graphs
         totals["loss"] += batch_loss.item() * scale
-        for key in ["slot", "quality", "keep_margin", "correction_margin"]:
+        for key in part_keys:
             totals[key] += last_parts[key].item() * scale
 
     dataset_size = len(loader.dataset)
@@ -202,6 +263,9 @@ def validate_epoch(model, loader, criterion, device):
     corrected_tooth = 0
     raw_correct_tooth = 0
     bad_change = 0
+    cross_dentition_bad_change = 0
+    fp_h_keep = 0
+    fp_h_total = 0
     pred_bg_for_tooth = 0
     tooth_total = 0
 
@@ -213,10 +277,11 @@ def validate_epoch(model, loader, criterion, device):
         total_loss += loss.item() * batch.num_graphs
 
         _, _, class_logits = step_to_logits(step_output)
+        _, quality_logits, _ = step_to_logits(step_output)
         raw_labels = get_raw_labels(batch).to(device)
         pred = conservative_relabel_for_validation(class_logits, raw_labels)
         y_true = batch.y.long().to(device)
-        slot_target = get_slot_targets(batch).to(device)
+        quality_target = get_quality_targets(batch).to(device)
         tooth_mask = y_true != BACKGROUND_IDX
 
         correct_total += int((pred == y_true).sum())
@@ -228,8 +293,21 @@ def validate_epoch(model, loader, criterion, device):
         raw_wrong_tooth += int(raw_wrong.sum())
         corrected_tooth += int((raw_wrong & (pred == y_true)).sum())
         bad_change += int((raw_correct & (pred != y_true)).sum())
+        cross_bad = (
+            raw_correct
+            & (pred != y_true)
+            & (get_dentition_groups(raw_labels) != get_dentition_groups(pred))
+        )
+        cross_dentition_bad_change += int(cross_bad.sum())
         pred_bg_for_tooth += int((tooth_mask & (pred == BACKGROUND_IDX)).sum())
         tooth_total += int(tooth_mask.sum())
+
+        if hasattr(batch, "node_role"):
+            node_role = batch.node_role.to(device)
+            fp_h_mask = (quality_target == 0) & (node_role == 3)
+            if fp_h_mask.any():
+                fp_h_keep += int((quality_logits[fp_h_mask, 1] >= quality_logits[fp_h_mask, 0]).sum())
+                fp_h_total += int(fp_h_mask.sum())
 
         confusion_mask = torch.zeros_like(y_true, dtype=torch.bool)
         for cls_idx in CONFUSION_SET_CLASSES:
@@ -242,9 +320,16 @@ def validate_epoch(model, loader, criterion, device):
         "correction_rate": corrected_tooth / raw_wrong_tooth if raw_wrong_tooth else 0.0,
         "bad_change_rate": bad_change / raw_correct_tooth if raw_correct_tooth else 0.0,
         "pred_bg_for_tooth_rate": pred_bg_for_tooth / tooth_total if tooth_total else 0.0,
+        "cross_dentition_bad_change_rate": (
+            cross_dentition_bad_change / raw_correct_tooth if raw_correct_tooth else 0.0
+        ),
+        "fp_h_keep_rate": fp_h_keep / fp_h_total if fp_h_total else 0.0,
         "raw_wrong_tooth_total": raw_wrong_tooth,
         "corrected_tooth_total": corrected_tooth,
         "bad_change_total": bad_change,
+        "cross_dentition_bad_change_total": cross_dentition_bad_change,
+        "fp_h_keep_total": fp_h_keep,
+        "fp_h_total": fp_h_total,
     }
     return (
         total_loss / len(loader.dataset),
@@ -336,6 +421,8 @@ def main():
             + 0.35 * val_conf_acc
             + 1.25 * val_diag["correction_rate"]
             - 1.25 * val_diag["bad_change_rate"]
+            - 0.75 * val_diag["cross_dentition_bad_change_rate"]
+            - 0.30 * val_diag["fp_h_keep_rate"]
             - 0.35 * val_diag["pred_bg_for_tooth_rate"]
             - 0.05 * val_loss
         )
@@ -349,15 +436,19 @@ def main():
         logging.info(
             f"Epoch {epoch:03d} | lr={optimizer.param_groups[0]['lr']:.1e} | "
             f"train_loss={train_metrics['loss']:.4f} "
-            f"(slot={train_metrics['slot']:.4f}, quality={train_metrics['quality']:.4f}) | "
+            f"(slot={train_metrics['slot']:.4f}, quality={train_metrics['quality']:.4f}, "
+            f"cross={train_metrics['cross_dentition']:.4f}) | "
             f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, conf_acc={val_conf_acc:.4f}, "
             f"correction_rate={val_diag['correction_rate']:.4f}, "
             f"bad_change_rate={val_diag['bad_change_rate']:.4f}, "
+            f"cross_bad_rate={val_diag['cross_dentition_bad_change_rate']:.4f}, "
+            f"fp_h_keep_rate={val_diag['fp_h_keep_rate']:.4f}, "
             f"pred_bg_tooth_rate={val_diag['pred_bg_for_tooth_rate']:.4f}, score={score:.4f}"
         )
 
         bad_change_ok = val_diag["bad_change_rate"] <= 0.015
-        if bad_change_ok and score > best_score:
+        cross_bad_ok = val_diag["cross_dentition_bad_change_rate"] <= 0.010
+        if bad_change_ok and cross_bad_ok and score > best_score:
             best_score = score
             best_summary = {
                 "val_loss": val_loss,
@@ -370,7 +461,10 @@ def main():
             logging.info(f"** best model saved: score={best_score:.4f}, summary={best_summary}")
         else:
             early_stop += 1
-            logging.info(f"no best update, early_stop={early_stop}/{args.patience}, bad_change_ok={bad_change_ok}")
+            logging.info(
+                f"no best update, early_stop={early_stop}/{args.patience}, "
+                f"bad_change_ok={bad_change_ok}, cross_bad_ok={cross_bad_ok}"
+            )
 
         ckpt_path = os.path.join(args.save_dir, f"model_epoch_{epoch:03d}.pth")
         torch.save(model.state_dict(), ckpt_path)
