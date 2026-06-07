@@ -12,10 +12,10 @@ from model import SlotQualityRecurrentAnatomyGAT
 
 N_CLASSES = 49
 BACKGROUND_IDX = 48
-NUM_RELATIONS = 4
-DEFAULT_TRAIN_DATA = "gnn_data/train_sin_arch4_edge_01_slot_struct.pt"
-DEFAULT_VAL_DATA = "gnn_data/val_sin_arch4_edge_01_slot_struct.pt"
-DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructPrior_NoVisual_Edge_Geom_Prior_T5"
+NUM_RELATIONS = 5
+DEFAULT_TRAIN_DATA = "gnn_data/train_sin_arch4_edge_01_slot_struct_order.pt"
+DEFAULT_VAL_DATA = "gnn_data/val_sin_arch4_edge_01_slot_struct_order.pt"
+DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructOrder_NoVisual_T5"
 
 CLASS_NAMES = [
     "11", "12", "13", "14", "15", "16", "17",
@@ -28,6 +28,14 @@ CLASS_NAMES = [
     "81", "82", "83", "84", "85",
 ]
 DENTITION_GROUPS = tuple(1 if int(name) // 10 >= 5 else 0 for name in CLASS_NAMES) + (2,)
+JAW_GROUPS = tuple(0 if int(name) // 10 in (1, 2, 5, 6) else 1 for name in CLASS_NAMES) + (2,)
+SIDE_GROUPS = tuple(0 if int(name) // 10 in (1, 4, 5, 8) else 1 for name in CLASS_NAMES) + (2,)
+TOOTH_INDEX = tuple(int(name) % 10 for name in CLASS_NAMES) + (0,)
+EXPECTED_JAW_RANK = tuple(
+    (1.0 if int(name) // 10 in (2, 3, 6, 7) else -1.0)
+    * ((int(name) % 10 - 1) / (4.0 if int(name) // 10 >= 5 else 6.0))
+    for name in CLASS_NAMES
+) + (0.0,)
 
 CONFUSION_SET_CLASSES = {
     11, 12, 21, 22, 31, 32, 41, 42,
@@ -47,7 +55,7 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=24)
     parser.add_argument("--num-iterations", type=int, default=5)
     parser.add_argument("--geom-dim", type=int, default=37)
-    parser.add_argument("--edge-attr-dim", type=int, default=16)
+    parser.add_argument("--edge-attr-dim", type=int, default=22)
     return parser.parse_args()
 
 
@@ -78,6 +86,35 @@ def get_detector_scores(batch):
 def get_dentition_groups(labels):
     lookup = torch.as_tensor(DENTITION_GROUPS, dtype=torch.long, device=labels.device)
     return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def get_jaw_groups(labels):
+    lookup = torch.as_tensor(JAW_GROUPS, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def get_side_groups(labels):
+    lookup = torch.as_tensor(SIDE_GROUPS, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def get_tooth_index(labels):
+    lookup = torch.as_tensor(TOOTH_INDEX, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def get_expected_jaw_rank(labels):
+    lookup = torch.as_tensor(EXPECTED_JAW_RANK, dtype=torch.float, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def adjacent_or_same_structure(a, b):
+    return (
+        (get_dentition_groups(a) == get_dentition_groups(b))
+        & (get_jaw_groups(a) == get_jaw_groups(b))
+        & (get_side_groups(a) == get_side_groups(b))
+        & ((get_tooth_index(a) - get_tooth_index(b)).abs() <= 1)
+    )
 
 
 def step_to_logits(step_output):
@@ -146,13 +183,14 @@ class SlotQualityCriterion(torch.nn.Module):
 
         raw_dentition = get_dentition_groups(raw_labels)
         target_dentition = get_dentition_groups(safe_slot_target)
+        pred_labels = slot_logits[:, :BACKGROUND_IDX].argmax(dim=1)
         cross_dentition_wrong = raw_correct & (raw_labels < BACKGROUND_IDX)
         cross_dentition_penalty = margin_loss(
             slot_logits,
             raw_labels.clamp(0, BACKGROUND_IDX - 1),
-            slot_logits[:, :BACKGROUND_IDX].argmax(dim=1),
+            pred_labels,
             cross_dentition_wrong
-            & (raw_dentition != get_dentition_groups(slot_logits[:, :BACKGROUND_IDX].argmax(dim=1)))
+            & (raw_dentition != get_dentition_groups(pred_labels))
             & (detector_scores >= 0.60),
             margin=0.30,
         )
@@ -164,6 +202,68 @@ class SlotQualityCriterion(torch.nn.Module):
             cross_dentition_correction,
             margin=0.35,
         )
+
+        tooth_probs = F.softmax(slot_logits, dim=1)
+        tooth_max_prob = tooth_probs.max(dim=1).values
+        background_mask = quality_target == 0
+        background_confidence_loss = weighted_mean(
+            F.relu(tooth_max_prob - 0.45),
+            background_mask.float(),
+        )
+
+        slot_prior = getattr(batch, "x_slot_prior", None)
+        if slot_prior is None:
+            slot_prior_margin = slot_logits.sum() * 0.0
+            raw_struct_score = torch.zeros_like(detector_scores)
+        else:
+            slot_prior = slot_prior.to(slot_logits.device)
+            target_prior = slot_prior.gather(1, safe_slot_target.unsqueeze(1)).squeeze(1)
+            raw_prior = slot_prior.gather(1, raw_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
+            competitor_prior = torch.topk(slot_prior, k=2, dim=1).values
+            best_other_prior = torch.where(
+                slot_prior.argmax(dim=1) == safe_slot_target,
+                competitor_prior[:, 1],
+                competitor_prior[:, 0],
+            )
+            slot_prior_margin = weighted_mean(
+                F.relu(0.20 - target_prior + best_other_prior),
+                slot_valid.float(),
+            )
+            raw_struct_score = raw_prior
+
+        overcorrect_mask = (
+            raw_correct
+            & (quality_target == 1)
+            & (detector_scores >= 0.75)
+            & (raw_struct_score >= 0.25)
+            & (~adjacent_or_same_structure(raw_labels, pred_labels))
+        )
+        overcorrection_loss = margin_loss(
+            slot_logits,
+            raw_labels.clamp(0, BACKGROUND_IDX - 1),
+            pred_labels,
+            overcorrect_mask,
+            margin=0.45,
+        )
+
+        pairwise_order_loss = slot_logits.sum() * 0.0
+        if hasattr(batch, "edge_index_sequence") and batch.edge_index_sequence.numel() > 0:
+            edge = batch.edge_index_sequence.to(slot_logits.device)
+            src, dst = edge[0], edge[1]
+            src_target = safe_slot_target[src]
+            dst_target = safe_slot_target[dst]
+            valid_edge = slot_valid[src] & slot_valid[dst] & (get_jaw_groups(src_target) == get_jaw_groups(dst_target))
+            if valid_edge.any():
+                pred_rank = tooth_probs @ torch.as_tensor(EXPECTED_JAW_RANK[:-1], dtype=torch.float, device=slot_logits.device)
+                target_rank = get_expected_jaw_rank(dst_target) - get_expected_jaw_rank(src_target)
+                spatial_rank = getattr(batch, "pos", torch.zeros((batch.num_nodes, 2), device=slot_logits.device)).to(slot_logits.device)
+                observed_sign = torch.sign(spatial_rank[dst, 0] - spatial_rank[src, 0])
+                expected_sign = torch.sign(target_rank)
+                edge_weight = valid_edge.float() * (observed_sign == expected_sign).float()
+                pairwise_order_loss = weighted_mean(
+                    F.relu(0.05 - (pred_rank[dst] - pred_rank[src]) * expected_sign),
+                    edge_weight,
+                )
 
         keep_vs_drop = F.relu(0.25 - quality_logits[:, 1] + quality_logits[:, 0])
         drop_vs_keep = F.relu(0.10 - quality_logits[:, 0] + quality_logits[:, 1])
@@ -180,6 +280,10 @@ class SlotQualityCriterion(torch.nn.Module):
             + 0.08 * cross_dentition_penalty
             + 0.05 * cross_dentition_correction_margin
             + 0.05 * quality_margin
+            + 0.08 * background_confidence_loss
+            + 0.05 * slot_prior_margin
+            + 0.06 * pairwise_order_loss
+            + 0.08 * overcorrection_loss
         )
         parts = {
             "slot": slot_loss.detach(),
@@ -189,19 +293,40 @@ class SlotQualityCriterion(torch.nn.Module):
             "cross_dentition": cross_dentition_penalty.detach(),
             "cross_dentition_correction": cross_dentition_correction_margin.detach(),
             "quality_margin": quality_margin.detach(),
+            "background_confidence": background_confidence_loss.detach(),
+            "slot_prior_margin": slot_prior_margin.detach(),
+            "pairwise_order": pairwise_order_loss.detach(),
+            "overcorrection": overcorrection_loss.detach(),
         }
         return total, parts
 
 
-def conservative_relabel_for_validation(class_logits, raw_labels, margin=0.06, min_prob=0.20):
+def conservative_relabel_for_validation(class_logits, raw_labels, quality_logits=None, slot_prior=None, detector_scores=None, margin=0.06, min_prob=0.20):
     probs = F.softmax(class_logits, dim=1)
     raw_labels = raw_labels.clamp(0, BACKGROUND_IDX)
     best_tooth_probs, best_tooth_labels = probs[:, :BACKGROUND_IDX].max(dim=1)
     raw_probs = probs.gather(1, raw_labels.unsqueeze(1)).squeeze(1)
+    keep_ok = torch.ones_like(best_tooth_probs, dtype=torch.bool)
+    if quality_logits is not None:
+        quality_probs = F.softmax(quality_logits, dim=1)
+        keep_ok = quality_probs[:, 1] >= 0.50
+    structure_ok = torch.ones_like(best_tooth_probs, dtype=torch.bool)
+    if slot_prior is not None:
+        slot_prior = slot_prior.to(class_logits.device)
+        new_prior = slot_prior.gather(1, best_tooth_labels.unsqueeze(1)).squeeze(1)
+        raw_prior = slot_prior.gather(1, raw_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
+        structure_ok = (new_prior >= raw_prior) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
+    if detector_scores is not None:
+        high_score_struct_ok = (detector_scores >= 0.75) & structure_ok
+        strict_high = detector_scores >= 0.85
+        structure_ok = structure_ok & (~high_score_struct_ok | adjacent_or_same_structure(raw_labels, best_tooth_labels))
+        structure_ok = structure_ok & (~strict_high | adjacent_or_same_structure(raw_labels, best_tooth_labels))
     relabel_mask = (
         (best_tooth_labels != raw_labels)
         & (best_tooth_probs >= min_prob)
         & ((best_tooth_probs - raw_probs) >= margin)
+        & keep_ok
+        & structure_ok
     )
     pred = raw_labels.clone()
     pred[relabel_mask] = best_tooth_labels[relabel_mask]
@@ -218,6 +343,10 @@ def train_epoch(model, loader, criterion, optimizer, device):
         "cross_dentition",
         "cross_dentition_correction",
         "quality_margin",
+        "background_confidence",
+        "slot_prior_margin",
+        "pairwise_order",
+        "overcorrection",
     ]
     totals = {"loss": 0.0, **{key: 0.0 for key in part_keys}}
     loss_weights = torch.tensor([0.2, 0.35, 0.5, 0.75, 1.0], device=device)
@@ -268,6 +397,9 @@ def validate_epoch(model, loader, criterion, device):
     fp_h_total = 0
     pred_bg_for_tooth = 0
     tooth_total = 0
+    top_fixes_total = 0
+    top_breaks_total = 0
+    wrong_to_wrong_total = 0
 
     for batch in loader:
         batch = batch.to(device)
@@ -279,7 +411,9 @@ def validate_epoch(model, loader, criterion, device):
         _, _, class_logits = step_to_logits(step_output)
         _, quality_logits, _ = step_to_logits(step_output)
         raw_labels = get_raw_labels(batch).to(device)
-        pred = conservative_relabel_for_validation(class_logits, raw_labels)
+        detector_scores = get_detector_scores(batch).to(device)
+        slot_prior = getattr(batch, "x_slot_prior", None)
+        pred = conservative_relabel_for_validation(class_logits, raw_labels, quality_logits, slot_prior, detector_scores)
         y_true = batch.y.long().to(device)
         quality_target = get_quality_targets(batch).to(device)
         tooth_mask = y_true != BACKGROUND_IDX
@@ -289,10 +423,17 @@ def validate_epoch(model, loader, criterion, device):
 
         raw_correct = tooth_mask & (raw_labels == y_true)
         raw_wrong = tooth_mask & (raw_labels != y_true)
+        top_pred = class_logits[:, :BACKGROUND_IDX].argmax(dim=1)
         raw_correct_tooth += int(raw_correct.sum())
         raw_wrong_tooth += int(raw_wrong.sum())
         corrected_tooth += int((raw_wrong & (pred == y_true)).sum())
         bad_change += int((raw_correct & (pred != y_true)).sum())
+        top_fixes = int((raw_wrong & (top_pred == y_true)).sum())
+        top_breaks = int((raw_correct & (top_pred != y_true)).sum())
+        wrong_to_wrong = int((raw_wrong & (pred != y_true)).sum())
+        top_fixes_total += top_fixes
+        top_breaks_total += top_breaks
+        wrong_to_wrong_total += wrong_to_wrong
         cross_bad = (
             raw_correct
             & (pred != y_true)
@@ -327,6 +468,12 @@ def validate_epoch(model, loader, criterion, device):
         "raw_wrong_tooth_total": raw_wrong_tooth,
         "corrected_tooth_total": corrected_tooth,
         "bad_change_total": bad_change,
+        "top_fixes_total": top_fixes_total,
+        "top_breaks_total": top_breaks_total,
+        "wrong_to_wrong_total": wrong_to_wrong_total,
+        "top_fix_rate": top_fixes_total / raw_wrong_tooth if raw_wrong_tooth else 0.0,
+        "top_break_rate": top_breaks_total / raw_correct_tooth if raw_correct_tooth else 0.0,
+        "wrong_to_wrong_rate": wrong_to_wrong_total / raw_wrong_tooth if raw_wrong_tooth else 0.0,
         "cross_dentition_bad_change_total": cross_dentition_bad_change,
         "fp_h_keep_total": fp_h_keep,
         "fp_h_total": fp_h_total,
@@ -419,8 +566,11 @@ def main():
         score = (
             0.40 * val_acc
             + 0.35 * val_conf_acc
-            + 1.25 * val_diag["correction_rate"]
-            - 1.25 * val_diag["bad_change_rate"]
+            + 1.50 * val_diag["correction_rate"]
+            + 0.55 * val_diag["top_fix_rate"]
+            - 1.80 * val_diag["bad_change_rate"]
+            - 0.65 * val_diag["top_break_rate"]
+            - 0.45 * val_diag["wrong_to_wrong_rate"]
             - 0.75 * val_diag["cross_dentition_bad_change_rate"]
             - 0.30 * val_diag["fp_h_keep_rate"]
             - 0.35 * val_diag["pred_bg_for_tooth_rate"]
@@ -437,10 +587,14 @@ def main():
             f"Epoch {epoch:03d} | lr={optimizer.param_groups[0]['lr']:.1e} | "
             f"train_loss={train_metrics['loss']:.4f} "
             f"(slot={train_metrics['slot']:.4f}, quality={train_metrics['quality']:.4f}, "
-            f"cross={train_metrics['cross_dentition']:.4f}) | "
+            f"cross={train_metrics['cross_dentition']:.4f}, bg={train_metrics['background_confidence']:.4f}, "
+            f"order={train_metrics['pairwise_order']:.4f}, over={train_metrics['overcorrection']:.4f}) | "
             f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, conf_acc={val_conf_acc:.4f}, "
             f"correction_rate={val_diag['correction_rate']:.4f}, "
             f"bad_change_rate={val_diag['bad_change_rate']:.4f}, "
+            f"top_fix_rate={val_diag['top_fix_rate']:.4f}, "
+            f"top_break_rate={val_diag['top_break_rate']:.4f}, "
+            f"wrong_to_wrong_rate={val_diag['wrong_to_wrong_rate']:.4f}, "
             f"cross_bad_rate={val_diag['cross_dentition_bad_change_rate']:.4f}, "
             f"fp_h_keep_rate={val_diag['fp_h_keep_rate']:.4f}, "
             f"pred_bg_tooth_rate={val_diag['pred_bg_for_tooth_rate']:.4f}, score={score:.4f}"

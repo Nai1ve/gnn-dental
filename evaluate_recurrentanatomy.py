@@ -16,10 +16,10 @@ from model import SlotQualityRecurrentAnatomyGAT
 
 N_CLASSES = 49
 BACKGROUND_IDX = 48
-NUM_RELATIONS = 4
-DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructPrior_NoVisual_Edge_Geom_Prior_T5/best_model.pth"
-DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot_struct.pt"
-DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_struct_t5_exp_open.pt"
+NUM_RELATIONS = 5
+DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5/best_model.pth"
+DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot_struct_order.pt"
+DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_struct_order_t5_exp_open.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CLASS_NAMES = [
@@ -33,6 +33,9 @@ CLASS_NAMES = [
     "81", "82", "83", "84", "85",
 ]
 DENTITION_GROUPS = tuple(1 if int(name) // 10 >= 5 else 0 for name in CLASS_NAMES) + (2,)
+JAW_GROUPS = tuple(0 if int(name) // 10 in (1, 2, 5, 6) else 1 for name in CLASS_NAMES) + (2,)
+SIDE_GROUPS = tuple(0 if int(name) // 10 in (1, 4, 5, 8) else 1 for name in CLASS_NAMES) + (2,)
+TOOTH_INDEX = tuple(int(name) % 10 for name in CLASS_NAMES) + (0,)
 
 CONFUSION_SET_CLASSES = {
     11, 12, 21, 22, 31, 32, 41, 42,
@@ -48,7 +51,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-iterations", type=int, default=5)
     parser.add_argument("--geom-dim", type=int, default=37)
-    parser.add_argument("--edge-attr-dim", type=int, default=16)
+    parser.add_argument("--edge-attr-dim", type=int, default=22)
     parser.add_argument("--relabel-margin", type=float, default=0.06)
     parser.add_argument("--relabel-min-prob", type=float, default=0.20)
     parser.add_argument("--duplicate-iou-threshold", type=float, default=0.50)
@@ -77,7 +80,9 @@ def parse_args():
     parser.add_argument("--background-score-cap", type=float, default=0.19)
     parser.add_argument("--background-score-multiplier", type=float, default=0.35)
     parser.add_argument("--disable-cross-dentition-guard", action="store_true")
-    parser.add_argument("--cross-dentition-guard-score-threshold", type=float, default=0.80)
+    parser.add_argument("--cross-dentition-guard-score-threshold", type=float, default=0.75)
+    parser.add_argument("--high-score-adjacent-threshold", type=float, default=0.85)
+    parser.add_argument("--drop-relabel-prob-threshold", type=float, default=0.55)
     parser.add_argument(
         "--save-attention",
         action="store_true",
@@ -129,6 +134,30 @@ def get_dentition_groups(labels):
     return lookup[labels.clamp(0, BACKGROUND_IDX)]
 
 
+def get_jaw_groups(labels):
+    lookup = torch.as_tensor(JAW_GROUPS, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def get_side_groups(labels):
+    lookup = torch.as_tensor(SIDE_GROUPS, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def get_tooth_index(labels):
+    lookup = torch.as_tensor(TOOTH_INDEX, dtype=torch.long, device=labels.device)
+    return lookup[labels.clamp(0, BACKGROUND_IDX)]
+
+
+def adjacent_or_same_structure(a, b):
+    return (
+        (get_dentition_groups(a) == get_dentition_groups(b))
+        & (get_jaw_groups(a) == get_jaw_groups(b))
+        & (get_side_groups(a) == get_side_groups(b))
+        & ((get_tooth_index(a) - get_tooth_index(b)).abs() <= 1)
+    )
+
+
 def get_scalar(value, default=-1):
     if value is None:
         return default
@@ -176,15 +205,46 @@ def unpack_last_step(model_output):
     return all_step_outputs[-1] if isinstance(all_step_outputs, list) else all_step_outputs
 
 
-def conservative_relabel(class_logits, raw_labels, relabel_margin, relabel_min_prob):
+def conservative_relabel(
+    class_logits,
+    quality_logits,
+    raw_labels,
+    detector_scores,
+    slot_prior,
+    relabel_margin,
+    relabel_min_prob,
+    high_score_adjacent_threshold,
+    drop_relabel_prob_threshold,
+):
     probs = F.softmax(class_logits, dim=1)
+    quality_probs = F.softmax(quality_logits, dim=1)
     raw_labels = raw_labels.to(class_logits.device).clamp(0, BACKGROUND_IDX)
     best_tooth_probs, best_tooth_labels = probs[:, :BACKGROUND_IDX].max(dim=1)
     raw_probs = probs.gather(1, raw_labels.unsqueeze(1)).squeeze(1)
+    keep_probs = quality_probs[:, 1]
+    drop_probs = quality_probs[:, 0]
+    if slot_prior is None:
+        structure_ok = torch.ones_like(best_tooth_probs, dtype=torch.bool)
+        raw_struct = torch.zeros_like(best_tooth_probs)
+        new_struct = torch.zeros_like(best_tooth_probs)
+    else:
+        slot_prior = slot_prior.to(class_logits.device)
+        raw_struct = slot_prior.gather(1, raw_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
+        new_struct = slot_prior.gather(1, best_tooth_labels.unsqueeze(1)).squeeze(1)
+        structure_ok = (new_struct >= raw_struct) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
+    adjacent_ok = adjacent_or_same_structure(raw_labels, best_tooth_labels)
+    high_score_protect = (detector_scores >= 0.75) & (raw_struct >= 0.25)
+    strict_high_protect = detector_scores >= float(high_score_adjacent_threshold)
+    drop_suppressed = (drop_probs >= float(drop_relabel_prob_threshold)) & (detector_scores <= 0.40)
     relabel_mask = (
         (best_tooth_labels != raw_labels)
         & (best_tooth_probs >= relabel_min_prob)
         & ((best_tooth_probs - raw_probs) >= relabel_margin)
+        & (keep_probs >= 0.50)
+        & structure_ok
+        & (~high_score_protect | adjacent_ok)
+        & (~strict_high_protect | adjacent_ok)
+        & (~drop_suppressed)
     )
     final_labels = raw_labels.clone()
     final_labels[relabel_mask] = best_tooth_labels[relabel_mask]
@@ -199,6 +259,8 @@ def duplicate_cleanup(
     duplicate_iou_threshold,
     duplicate_ios_threshold,
     duplicate_action="low_score",
+    quality_probs=None,
+    slot_prior=None,
 ):
     labels = labels.clone()
     duplicate_mask = torch.zeros_like(labels, dtype=torch.bool)
@@ -208,6 +270,12 @@ def duplicate_cleanup(
     safe_labels = labels.clamp(0, BACKGROUND_IDX)
     label_probs = class_probs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
     keep_score = detector_scores + 0.20 * label_probs
+    if quality_probs is not None:
+        keep_score = keep_score + 0.25 * quality_probs[:, 1]
+    if slot_prior is not None:
+        slot_prior = slot_prior.to(labels.device)
+        slot_score = slot_prior.gather(1, safe_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
+        keep_score = keep_score + 0.12 * slot_score.clamp(-2.0, 2.0)
 
     for cls_idx in range(BACKGROUND_IDX):
         cls_indices = torch.where(labels == cls_idx)[0]
@@ -310,24 +378,33 @@ def calibrate_scores(
 
 
 def postprocess_graph(step_output, graph, args):
-    _, _, class_logits = step_to_logits(step_output)
+    _, quality_logits, class_logits = step_to_logits(step_output)
     raw_labels = get_prior_labels(graph).to(class_logits.device)
     detector_scores = get_detector_scores(graph).to(class_logits.device)
     boxes = get_raw_boxes(graph).to(class_logits.device)
+    slot_prior = getattr(graph, "x_slot_prior", None)
+    quality_probs = F.softmax(quality_logits, dim=1)
     relabeled, class_probs, best_tooth_labels, relabel_mask = conservative_relabel(
         class_logits,
+        quality_logits,
         raw_labels,
+        detector_scores,
+        slot_prior,
         args.relabel_margin,
         args.relabel_min_prob,
+        args.high_score_adjacent_threshold,
+        args.drop_relabel_prob_threshold,
     )
     postprocessed, duplicate_mask = duplicate_cleanup(
-        relabeled,
-        boxes,
-        detector_scores,
-        class_probs,
-        args.duplicate_iou_threshold,
-        args.duplicate_ios_threshold,
-        args.duplicate_action,
+        labels=relabeled,
+        boxes=boxes,
+        detector_scores=detector_scores,
+        class_probs=class_probs,
+        duplicate_iou_threshold=args.duplicate_iou_threshold,
+        duplicate_ios_threshold=args.duplicate_ios_threshold,
+        duplicate_action=args.duplicate_action,
+        quality_probs=quality_probs,
+        slot_prior=slot_prior.to(class_logits.device) if slot_prior is not None else None,
     )
     postprocessed, relabel_mask, cross_dentition_guard_mask = apply_cross_dentition_guard(
         postprocessed,
@@ -459,6 +536,7 @@ def generate_per_graph_predictions(model, test_data_list, device, save_path, arg
                 "pred_scores_gnn": processed["pred_scores_gnn"],
                 "gnn_logits": processed["gnn_logits"],
                 "gnn_probs": processed["gnn_probs"],
+                "fusion_weights": step_output.get("fusion_weights", torch.empty((num_nodes, 3), device=step_output["slot_logits"].device))[node_offset:node_offset + num_nodes].detach().cpu(),
                 "relabel_mask": processed["relabel_mask"],
                 "duplicate_suppressed_mask": processed["duplicate_suppressed_mask"],
                 "background_soft_suppressed_mask": processed["background_soft_suppressed_mask"],

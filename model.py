@@ -837,10 +837,10 @@ class RecurrentAnatomyGATNew_A(torch.nn.Module):
 
 
 class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
-    def __init__(self, n_classes=49, num_relations=4, num_iterations=5,
+    def __init__(self, n_classes=49, num_relations=5, num_iterations=5,
                  use_visual=False, use_geom=True, use_prior=True,
                  use_edge_features=True, spatial_only=False,
-                 geom_dim=37, edge_attr_dim=16):
+                 geom_dim=37, edge_attr_dim=22):
         super().__init__()
         self.n_classes = n_classes
         self.background_idx = n_classes - 1
@@ -905,9 +905,13 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
         )
         self.structural_bias = torch.nn.Linear(geom_dim, self.background_idx, bias=False)
         torch.nn.init.zeros_(self.structural_bias.weight)
-        self.structural_bias_scale = 0.15
+        self.slot_fusion_gate = torch.nn.Sequential(
+            torch.nn.Linear(self.fused_dim + self.background_idx + self.background_idx, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 3),
+        )
         self.belief_gate = torch.nn.Sequential(
-            torch.nn.Linear(self.fused_dim, 32),
+            torch.nn.Linear(self.fused_dim + 3, 32),
             torch.nn.ReLU(),
             torch.nn.Linear(32, 1),
         )
@@ -926,19 +930,27 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             data.edge_index_overlap, data.edge_index_arch,
             data.edge_index_vertical, data.edge_index_spatial
         ]
+        if hasattr(data, "edge_index_sequence"):
+            edge_idx_list.append(data.edge_index_sequence)
         edge_index = torch.cat([e.to(device) for e in edge_idx_list], dim=1)
         type_overlap = torch.zeros(data.edge_index_overlap.size(1), dtype=torch.long, device=device)
         type_arch = torch.ones(data.edge_index_arch.size(1), dtype=torch.long, device=device)
         type_vertical = torch.full((data.edge_index_vertical.size(1),), 2, dtype=torch.long, device=device)
         type_spatial = torch.full((data.edge_index_spatial.size(1),), 3, dtype=torch.long, device=device)
-        edge_type = torch.cat([type_overlap, type_arch, type_vertical, type_spatial], dim=0)
+        edge_types = [type_overlap, type_arch, type_vertical, type_spatial]
+        if hasattr(data, "edge_index_sequence"):
+            edge_types.append(torch.full((data.edge_index_sequence.size(1),), 4, dtype=torch.long, device=device))
+        edge_type = torch.cat(edge_types, dim=0)
 
-        raw_edge_attr = torch.cat([
+        edge_attrs = [
             self._align_edge_attr(data.edge_attr_overlap.to(device)),
             self._align_edge_attr(data.edge_attr_arch.to(device)),
             self._align_edge_attr(data.edge_attr_vertical.to(device)),
             self._align_edge_attr(data.edge_attr_spatial.to(device)),
-        ], dim=0)
+        ]
+        if hasattr(data, "edge_attr_sequence"):
+            edge_attrs.append(self._align_edge_attr(data.edge_attr_sequence.to(device)))
+        raw_edge_attr = torch.cat(edge_attrs, dim=0)
 
         if self.spatial_only:
             mask = edge_type == 3
@@ -969,6 +981,12 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
         original_prior = data.x_prior.to(device)
         if not self.use_prior:
             original_prior = torch.zeros_like(original_prior)
+        detector_slot_logits = torch.log(original_prior[:, :self.background_idx].clamp_min(1e-6))
+        slot_prior = getattr(data, "x_slot_prior", torch.zeros_like(detector_slot_logits)).to(device)
+        raw_scores = ((original_prior[:, -1:] + 1.0) / 2.0).clamp(0.0, 1.0)
+        raw_labels = torch.argmax(original_prior[:, :self.background_idx], dim=1)
+        raw_slot_prior = slot_prior.gather(1, raw_labels.unsqueeze(1))
+        raw_struct_ok = (raw_slot_prior > 0.25).float()
 
         current_dynamic_belief = original_prior.clone()
         all_step_outputs = []
@@ -996,11 +1014,20 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             h_2 = F.elu(h_2) + h_1
             h_2 = self.norm_2(h_2)
 
-            slot_logits = self.slot_head(h_2) + self.structural_bias_scale * structural_slot_bias
+            relational_logits = self.slot_head(h_2)
+            struct_logits = slot_prior + structural_slot_bias
+            fusion_input = torch.cat([h_2, detector_slot_logits, slot_prior], dim=1)
+            fusion_weights = F.softmax(self.slot_fusion_gate(fusion_input), dim=1)
+            slot_logits = (
+                fusion_weights[:, 0:1] * relational_logits
+                + fusion_weights[:, 1:2] * detector_slot_logits
+                + fusion_weights[:, 2:3] * struct_logits
+            )
             quality_logits = self.quality_head(h_2)
             all_step_outputs.append({
                 "slot_logits": slot_logits,
                 "quality_logits": quality_logits,
+                "fusion_weights": fusion_weights,
             })
 
             if t < self.num_iterations - 1:
@@ -1009,7 +1036,10 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
                 bg_prob = quality_probs[:, :1]
                 confidence, _ = torch.max(slot_probs, dim=1, keepdim=True)
                 candidate_belief = torch.cat([slot_probs, bg_prob, confidence], dim=1)
-                update_gate = 0.65 * torch.sigmoid(self.belief_gate(h_2))
+                gate_features = torch.cat([h_2, raw_scores, raw_struct_ok, confidence], dim=1)
+                base_gate = torch.sigmoid(self.belief_gate(gate_features))
+                protect = (raw_scores * raw_struct_ok).clamp(0.0, 1.0)
+                update_gate = (0.70 - 0.45 * protect) * base_gate
                 current_dynamic_belief = (1.0 - update_gate) * original_prior + update_gate * candidate_belief
 
         if return_att:

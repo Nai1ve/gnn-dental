@@ -42,6 +42,8 @@ EXPECTED_JAW_RANK = np.asarray([
     * ((int(name) % 10 - 1) / (4.0 if int(name) // 10 >= 5 else 6.0))
     for name in CLASS_NAMES
 ] + [0.0], dtype=np.float32)
+EXPECTED_IS_UPPER = np.asarray([int(name) // 10 in (1, 2, 5, 6) for name in CLASS_NAMES], dtype=bool)
+EXPECTED_IS_LEFT = np.asarray([int(name) // 10 in (1, 4, 5, 8) for name in CLASS_NAMES], dtype=bool)
 
 
 def is_missing_feature(value) -> bool:
@@ -192,6 +194,37 @@ def label_structure_features(labels: torch.Tensor, is_upper: torch.Tensor, is_le
     ], dim=1).float()
 
 
+def compute_slot_prior(labels: torch.Tensor, is_upper: torch.Tensor, is_left: torch.Tensor, rank_jaw: torch.Tensor):
+    device = labels.device
+    safe_labels = labels.clamp(0, BACKGROUND)
+    raw_dentition = torch.as_tensor(DENTITION_GROUPS, dtype=torch.long, device=device)[safe_labels]
+    class_dentition = torch.as_tensor(DENTITION_GROUPS[:-1], dtype=torch.long, device=device)
+    class_is_upper = torch.as_tensor(EXPECTED_IS_UPPER, dtype=torch.bool, device=device)
+    class_is_left = torch.as_tensor(EXPECTED_IS_LEFT, dtype=torch.bool, device=device)
+    class_expected_rank = torch.as_tensor(EXPECTED_JAW_RANK[:-1], dtype=torch.float, device=device)
+
+    jaw_score = torch.where(
+        is_upper[:, None] == class_is_upper[None, :],
+        torch.ones((labels.numel(), BACKGROUND), device=device),
+        -torch.ones((labels.numel(), BACKGROUND), device=device),
+    )
+    side_score = torch.where(
+        is_left[:, None] == class_is_left[None, :],
+        torch.ones((labels.numel(), BACKGROUND), device=device),
+        -torch.ones((labels.numel(), BACKGROUND), device=device),
+    )
+    rank_score = 1.0 - (rank_jaw[:, None] - class_expected_rank[None, :]).abs().clamp(0.0, 2.0)
+    valid_raw = safe_labels < BACKGROUND
+    dentition_match = raw_dentition[:, None] == class_dentition[None, :]
+    dentition_score = torch.where(
+        dentition_match,
+        torch.full((labels.numel(), BACKGROUND), 0.5, device=device),
+        torch.full((labels.numel(), BACKGROUND), -0.35, device=device),
+    )
+    dentition_score = dentition_score * valid_raw[:, None].float()
+    return (1.1 * jaw_score + 1.0 * side_score + 1.4 * rank_score + 0.5 * dentition_score).float()
+
+
 def calculate_iou_np(box_a, box_b) -> float:
     xa = max(box_a[0], box_b[0])
     ya = max(box_a[1], box_b[1])
@@ -319,7 +352,7 @@ def build_multi_relation_graph(
     device = boxes.device
     empty = torch.empty((2, 0), dtype=torch.long, device=device)
     if n < 2:
-        return empty, empty, empty, empty, torch.zeros((n, n), device=device), torch.zeros((n, n), device=device)
+        return empty, empty, empty, empty, empty, torch.zeros((n, n), device=device), torch.zeros((n, n), device=device)
 
     iou = torchvision.ops.box_iou(boxes, boxes)
     area = (boxes[:, 2] - boxes[:, 0]).clamp_min(0) * (boxes[:, 3] - boxes[:, 1]).clamp_min(0)
@@ -354,7 +387,22 @@ def build_multi_relation_graph(
     spatial_dist = torch.cdist(centers, centers, p=2)
     spatial_dist.fill_diagonal_(float("inf"))
     edge_spatial = topk_edges(spatial_dist, k_spatial)
-    return edge_overlap, edge_arch, edge_vertical, edge_spatial, iou, ios
+
+    seq_edges = []
+    for jaw_mask in (is_upper, ~is_upper):
+        idx = torch.where(jaw_mask)[0]
+        if idx.numel() <= 1:
+            continue
+        order = idx[torch.argsort(centers[idx, 0])]
+        for offset in (1, 2):
+            if order.numel() <= offset:
+                continue
+            src = order[:-offset]
+            dst = order[offset:]
+            seq_edges.append(torch.stack([src, dst], dim=0))
+            seq_edges.append(torch.stack([dst, src], dim=0))
+    edge_sequence = torch.cat(seq_edges, dim=1) if seq_edges else empty
+    return edge_overlap, edge_arch, edge_vertical, edge_spatial, edge_sequence, iou, ios
 
 
 def topk_edges(dist_matrix: torch.Tensor, k: int) -> torch.Tensor:
@@ -373,6 +421,8 @@ def compute_edge_attributes(
     boxes: torch.Tensor,
     centers: torch.Tensor,
     labels: torch.Tensor,
+    scores: torch.Tensor,
+    slot_prior: torch.Tensor,
     img_w: float,
     img_h: float,
     iou_matrix: torch.Tensor,
@@ -382,7 +432,7 @@ def compute_edge_attributes(
     rank_jaw: torch.Tensor,
 ):
     if edge_index.numel() == 0:
-        return torch.empty((0, 16), dtype=torch.float, device=boxes.device)
+        return torch.empty((0, 22), dtype=torch.float, device=boxes.device)
     src, dst = edge_index[0], edge_index[1]
     dx = (centers[dst, 0] - centers[src, 0]) / max(img_w, EPS)
     dy = (centers[dst, 1] - centers[src, 1]) / max(img_h, EPS)
@@ -409,6 +459,13 @@ def compute_edge_attributes(
     order_delta_label = ((label_order[dst] - label_order[src]).clamp(-1.0, 1.0) * valid_pair)
     adjacent_label = ((torch.abs(label_index[dst] - label_index[src]) == 1).float()
                       * same_dentition_label * same_jaw_label * same_side_label)
+    raw_slot = slot_prior.gather(1, safe_labels.clamp(0, BACKGROUND - 1).unsqueeze(1)).squeeze(1)
+    src_raw_slot = raw_slot[src]
+    dst_raw_slot = raw_slot[dst]
+    expected_rank = torch.as_tensor(EXPECTED_JAW_RANK, dtype=torch.float, device=device)[safe_labels]
+    expected_order_delta = ((expected_rank[dst] - expected_rank[src]).clamp(-2.0, 2.0) / 2.0) * valid_pair
+    observed_order_delta = rank_delta
+    order_consistency = (1.0 - (observed_order_delta - expected_order_delta).abs()).clamp(-1.0, 1.0) * valid_pair
     return torch.stack([
         dx,
         dy,
@@ -426,6 +483,12 @@ def compute_edge_attributes(
         same_side_label,
         order_delta_label,
         adjacent_label,
+        scores[src] * 2.0 - 1.0,
+        scores[dst] * 2.0 - 1.0,
+        src_raw_slot.clamp(-4.0, 4.0) / 4.0,
+        dst_raw_slot.clamp(-4.0, 4.0) / 4.0,
+        expected_order_delta,
+        order_consistency,
     ], dim=1).float()
 
 
@@ -490,6 +553,7 @@ def build_graph_from_features(
     rel_coord = torch.cat([enc_dx, enc_dy], dim=1)
     node_space, is_upper, is_left, rank_jaw = jaw_side_rank_features(centers, img_w, img_h)
     label_space = label_structure_features(labels, is_upper, is_left, rank_jaw)
+    x_slot_prior = compute_slot_prior(labels, is_upper, is_left, rank_jaw)
 
     geom_features = []
     for i in range(boxes.size(0)):
@@ -510,7 +574,7 @@ def build_graph_from_features(
     x_visual = torch.zeros((boxes.size(0), visual_dim), dtype=torch.float)
     x_prior = torch.cat([class_probs, (scores * 2 - 1).unsqueeze(1)], dim=1).float()
 
-    edge_overlap, edge_arch, edge_vertical, edge_spatial, iou_matrix, ios_matrix = build_multi_relation_graph(
+    edge_overlap, edge_arch, edge_vertical, edge_spatial, edge_sequence, iou_matrix, ios_matrix = build_multi_relation_graph(
         boxes=boxes,
         centers=centers,
         iou_threshold=iou_threshold_graph,
@@ -521,10 +585,11 @@ def build_graph_from_features(
         x_penalty=5.0,
     )
 
-    edge_attr_overlap = compute_edge_attributes(edge_overlap, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
-    edge_attr_arch = compute_edge_attributes(edge_arch, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
-    edge_attr_vertical = compute_edge_attributes(edge_vertical, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
-    edge_attr_spatial = compute_edge_attributes(edge_spatial, boxes, centers, labels, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_overlap = compute_edge_attributes(edge_overlap, boxes, centers, labels, scores, x_slot_prior, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_arch = compute_edge_attributes(edge_arch, boxes, centers, labels, scores, x_slot_prior, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_vertical = compute_edge_attributes(edge_vertical, boxes, centers, labels, scores, x_slot_prior, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_spatial = compute_edge_attributes(edge_spatial, boxes, centers, labels, scores, x_slot_prior, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
+    edge_attr_sequence = compute_edge_attributes(edge_sequence, boxes, centers, labels, scores, x_slot_prior, img_w, img_h, iou_matrix, ios_matrix, is_upper, is_left, rank_jaw)
 
     pos_normalized = torch.stack([
         (centers[:, 0] / img_w) * 2 - 1,
@@ -535,14 +600,17 @@ def build_graph_from_features(
         x_visual=x_visual,
         x_geom=x_geom,
         x_prior=x_prior,
+        x_slot_prior=x_slot_prior,
         edge_index_overlap=edge_overlap,
         edge_index_arch=edge_arch,
         edge_index_vertical=edge_vertical,
         edge_index_spatial=edge_spatial,
+        edge_index_sequence=edge_sequence,
         edge_attr_overlap=edge_attr_overlap,
         edge_attr_arch=edge_attr_arch,
         edge_attr_vertical=edge_attr_vertical,
         edge_attr_spatial=edge_attr_spatial,
+        edge_attr_sequence=edge_attr_sequence,
         y=y,
         slot_y=slot,
         quality_y=quality,
