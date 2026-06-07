@@ -17,7 +17,7 @@ from model import SlotQualityRecurrentAnatomyGAT
 N_CLASSES = 49
 BACKGROUND_IDX = 48
 NUM_RELATIONS = 5
-DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5/best_model.pth"
+DEFAULT_MODEL_PATH = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_unfreeze/best_model.pth"
 DEFAULT_TEST_DATA_PATH = "gnn_data/test_ccsw_liu_exp_open_slot_struct_order.pt"
 DEFAULT_OUTPUT_NAME = "graph_by_graph_predictions_recurrent_ccsw_slot_quality_struct_order_t5_exp_open.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,10 +52,13 @@ def parse_args():
     parser.add_argument("--num-iterations", type=int, default=5)
     parser.add_argument("--geom-dim", type=int, default=37)
     parser.add_argument("--edge-attr-dim", type=int, default=22)
-    parser.add_argument("--relabel-margin", type=float, default=0.035)
-    parser.add_argument("--relabel-min-prob", type=float, default=0.15)
+    parser.add_argument("--relabel-margin", type=float, default=0.025)
+    parser.add_argument("--relabel-min-prob", type=float, default=0.12)
+    parser.add_argument("--relabel-keep-prob-threshold", type=float, default=0.42)
+    parser.add_argument("--relabel-structure-tolerance", type=float, default=0.20)
+    parser.add_argument("--struct-candidate-weight", type=float, default=0.25)
     parser.add_argument("--duplicate-iou-threshold", type=float, default=0.50)
-    parser.add_argument("--duplicate-ios-threshold", type=float, default=0.75)
+    parser.add_argument("--duplicate-ios-threshold", type=float, default=0.70)
     parser.add_argument(
         "--score-calibration",
         choices=("raw", "gnn_delta"),
@@ -213,14 +216,24 @@ def conservative_relabel(
     slot_prior,
     relabel_margin,
     relabel_min_prob,
+    relabel_keep_prob_threshold,
+    relabel_structure_tolerance,
+    struct_candidate_weight,
     high_score_adjacent_threshold,
     drop_relabel_prob_threshold,
 ):
-    probs = F.softmax(class_logits, dim=1)
+    base_probs = F.softmax(class_logits, dim=1)
     quality_probs = F.softmax(quality_logits, dim=1)
     raw_labels = raw_labels.to(class_logits.device).clamp(0, BACKGROUND_IDX)
-    best_tooth_probs, best_tooth_labels = probs[:, :BACKGROUND_IDX].max(dim=1)
-    raw_probs = probs.gather(1, raw_labels.unsqueeze(1)).squeeze(1)
+    candidate_logits = class_logits.clone()
+    if slot_prior is not None and struct_candidate_weight > 0:
+        candidate_logits[:, :BACKGROUND_IDX] = (
+            candidate_logits[:, :BACKGROUND_IDX]
+            + float(struct_candidate_weight) * slot_prior.to(class_logits.device)
+        )
+    candidate_probs = F.softmax(candidate_logits, dim=1)
+    best_tooth_probs, best_tooth_labels = candidate_probs[:, :BACKGROUND_IDX].max(dim=1)
+    raw_probs = candidate_probs.gather(1, raw_labels.unsqueeze(1)).squeeze(1)
     keep_probs = quality_probs[:, 1]
     drop_probs = quality_probs[:, 0]
     if slot_prior is None:
@@ -231,7 +244,7 @@ def conservative_relabel(
         slot_prior = slot_prior.to(class_logits.device)
         raw_struct = slot_prior.gather(1, raw_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
         new_struct = slot_prior.gather(1, best_tooth_labels.unsqueeze(1)).squeeze(1)
-        structure_ok = (new_struct + 0.12 >= raw_struct) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
+        structure_ok = (new_struct + relabel_structure_tolerance >= raw_struct) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
     adjacent_ok = adjacent_or_same_structure(raw_labels, best_tooth_labels)
     high_score_protect = (detector_scores >= 0.75) & (raw_struct >= 0.25)
     strict_high_protect = detector_scores >= float(high_score_adjacent_threshold)
@@ -240,7 +253,7 @@ def conservative_relabel(
         (best_tooth_labels != raw_labels)
         & (best_tooth_probs >= relabel_min_prob)
         & ((best_tooth_probs - raw_probs) >= relabel_margin)
-        & (keep_probs >= 0.45)
+        & (keep_probs >= relabel_keep_prob_threshold)
         & structure_ok
         & (~high_score_protect | adjacent_ok)
         & (~strict_high_protect | adjacent_ok)
@@ -248,7 +261,7 @@ def conservative_relabel(
     )
     final_labels = raw_labels.clone()
     final_labels[relabel_mask] = best_tooth_labels[relabel_mask]
-    return final_labels, probs, best_tooth_labels, relabel_mask
+    return final_labels, candidate_probs, base_probs, best_tooth_labels, relabel_mask
 
 
 def duplicate_cleanup(
@@ -384,7 +397,7 @@ def postprocess_graph(step_output, graph, args):
     boxes = get_raw_boxes(graph).to(class_logits.device)
     slot_prior = getattr(graph, "x_slot_prior", None)
     quality_probs = F.softmax(quality_logits, dim=1)
-    relabeled, class_probs, best_tooth_labels, relabel_mask = conservative_relabel(
+    relabeled, class_probs, base_probs, best_tooth_labels, relabel_mask = conservative_relabel(
         class_logits,
         quality_logits,
         raw_labels,
@@ -392,6 +405,9 @@ def postprocess_graph(step_output, graph, args):
         slot_prior,
         args.relabel_margin,
         args.relabel_min_prob,
+        args.relabel_keep_prob_threshold,
+        args.relabel_structure_tolerance,
+        args.struct_candidate_weight,
         args.high_score_adjacent_threshold,
         args.drop_relabel_prob_threshold,
     )
@@ -417,7 +433,7 @@ def postprocess_graph(step_output, graph, args):
     calibrated_scores, background_soft_mask = calibrate_scores(
         detector_scores,
         postprocessed,
-        class_probs,
+        base_probs,
         duplicate_mask,
         args.score_calibration,
         args.duplicate_action,
@@ -587,6 +603,9 @@ def main():
     logging.info(f"test_data={args.test_data_path}, graphs={len(test_data_list)}")
     logging.info(
         f"postprocess: relabel_margin={args.relabel_margin}, relabel_min_prob={args.relabel_min_prob}, "
+        f"relabel_keep_prob_threshold={args.relabel_keep_prob_threshold}, "
+        f"relabel_structure_tolerance={args.relabel_structure_tolerance}, "
+        f"struct_candidate_weight={args.struct_candidate_weight}, "
         f"duplicate_iou={args.duplicate_iou_threshold}, duplicate_ios={args.duplicate_ios_threshold}, "
         f"duplicate_action={args.duplicate_action}, duplicate_score_cap={args.duplicate_score_cap}, "
         f"score_calibration={args.score_calibration}, "
@@ -605,7 +624,15 @@ def main():
     state = torch.load(args.model_path, map_location=DEVICE)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
-    model.load_state_dict(state)
+    load_result = model.load_state_dict(state, strict=False)
+    allowed_missing = {"slot_fusion_floor"}
+    missing = [key for key in load_result.missing_keys if key not in allowed_missing]
+    if missing or load_result.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint mismatch. missing={missing}, unexpected={load_result.unexpected_keys}"
+        )
+    if load_result.missing_keys:
+        logging.warning(f"ignored missing non-parameter keys: {load_result.missing_keys}")
     logging.info(f"loaded model: {args.model_path}")
 
     loader = DataLoader(test_data_list, batch_size=args.batch_size, shuffle=False)
