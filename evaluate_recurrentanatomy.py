@@ -61,13 +61,23 @@ def parse_args():
     parser.add_argument("--duplicate-ios-threshold", type=float, default=0.70)
     parser.add_argument(
         "--score-calibration",
-        choices=("raw", "gnn_delta", "ap_aware"),
-        default="ap_aware",
+        choices=("raw", "gnn_delta", "ap_aware", "ap_aware_light"),
+        default="ap_aware_light",
         help=(
             "raw keeps detector scores except soft suppression; gnn_delta applies the older light GNN probability multiplier; "
-            "ap_aware uses the learned score_delta head for COCO ranking calibration."
+            "ap_aware uses the learned score_delta head for COCO ranking calibration; "
+            "ap_aware_light uses a smaller learned calibration to preserve detector AP."
         ),
     )
+    parser.add_argument("--ap-aware-score-weight", type=float, default=0.18)
+    parser.add_argument("--ap-aware-prob-weight", type=float, default=0.04)
+    parser.add_argument("--ap-aware-min-multiplier", type=float, default=0.72)
+    parser.add_argument("--ap-aware-max-multiplier", type=float, default=1.12)
+    parser.add_argument("--ap-aware-light-score-weight", type=float, default=0.06)
+    parser.add_argument("--ap-aware-light-prob-weight", type=float, default=0.02)
+    parser.add_argument("--ap-aware-light-min-multiplier", type=float, default=0.90)
+    parser.add_argument("--ap-aware-light-max-multiplier", type=float, default=1.06)
+    parser.add_argument("--duplicate-score-weight", type=float, default=0.18)
     parser.add_argument(
         "--duplicate-action",
         choices=("low_score", "background"),
@@ -278,6 +288,7 @@ def duplicate_cleanup(
     quality_probs=None,
     slot_prior=None,
     score_delta=None,
+    score_delta_weight=0.18,
 ):
     labels = labels.clone()
     duplicate_mask = torch.zeros_like(labels, dtype=torch.bool)
@@ -293,8 +304,8 @@ def duplicate_cleanup(
         slot_prior = slot_prior.to(labels.device)
         slot_score = slot_prior.gather(1, safe_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
         keep_score = keep_score + 0.12 * slot_score.clamp(-2.0, 2.0)
-    if score_delta is not None:
-        keep_score = keep_score + 0.18 * torch.tanh(score_delta.to(labels.device)).clamp(-1.0, 1.0)
+    if score_delta is not None and score_delta_weight != 0:
+        keep_score = keep_score + float(score_delta_weight) * torch.tanh(score_delta.to(labels.device)).clamp(-1.0, 1.0)
 
     for cls_idx in range(BACKGROUND_IDX):
         cls_indices = torch.where(labels == cls_idx)[0]
@@ -362,6 +373,14 @@ def calibrate_scores(
     background_detector_score_threshold=0.40,
     background_score_cap=0.19,
     background_score_multiplier=0.35,
+    ap_score_weight=0.18,
+    ap_prob_weight=0.04,
+    ap_min_multiplier=0.72,
+    ap_max_multiplier=1.12,
+    ap_light_score_weight=0.06,
+    ap_light_prob_weight=0.02,
+    ap_light_min_multiplier=0.90,
+    ap_light_max_multiplier=1.06,
 ):
     safe_labels = final_labels.clamp(0, BACKGROUND_IDX)
     label_probs = class_probs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
@@ -370,7 +389,20 @@ def calibrate_scores(
     if score_calibration == "ap_aware" and score_delta is not None:
         learned_delta = torch.tanh(score_delta).clamp(-1.0, 1.0)
         prob_delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
-        multiplier = (1.0 + 0.18 * learned_delta + 0.04 * prob_delta).clamp(0.72, 1.12)
+        multiplier = (
+            1.0
+            + float(ap_score_weight) * learned_delta
+            + float(ap_prob_weight) * prob_delta
+        ).clamp(float(ap_min_multiplier), float(ap_max_multiplier))
+        calibrated = (detector_scores * multiplier).clamp(0, 1)
+    elif score_calibration == "ap_aware_light" and score_delta is not None:
+        learned_delta = torch.tanh(score_delta).clamp(-1.0, 1.0)
+        prob_delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
+        multiplier = (
+            1.0
+            + float(ap_light_score_weight) * learned_delta
+            + float(ap_light_prob_weight) * prob_delta
+        ).clamp(float(ap_light_min_multiplier), float(ap_light_max_multiplier))
         calibrated = (detector_scores * multiplier).clamp(0, 1)
     elif score_calibration == "gnn_delta":
         delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
@@ -434,6 +466,7 @@ def postprocess_graph(step_output, graph, args):
         quality_probs=quality_probs,
         slot_prior=slot_prior.to(class_logits.device) if slot_prior is not None else None,
         score_delta=step_output.get("score_delta"),
+        score_delta_weight=args.duplicate_score_weight,
     )
     postprocessed, relabel_mask, cross_dentition_guard_mask = apply_cross_dentition_guard(
         postprocessed,
@@ -458,6 +491,14 @@ def postprocess_graph(step_output, graph, args):
         args.background_detector_score_threshold,
         args.background_score_cap,
         args.background_score_multiplier,
+        args.ap_aware_score_weight,
+        args.ap_aware_prob_weight,
+        args.ap_aware_min_multiplier,
+        args.ap_aware_max_multiplier,
+        args.ap_aware_light_score_weight,
+        args.ap_aware_light_prob_weight,
+        args.ap_aware_light_min_multiplier,
+        args.ap_aware_light_max_multiplier,
     )
     return {
         "pred_original": raw_labels.detach().cpu(),
@@ -628,6 +669,11 @@ def main():
         f"duplicate_iou={args.duplicate_iou_threshold}, duplicate_ios={args.duplicate_ios_threshold}, "
         f"duplicate_action={args.duplicate_action}, duplicate_score_cap={args.duplicate_score_cap}, "
         f"score_calibration={args.score_calibration}, "
+        f"ap_aware=({args.ap_aware_score_weight}/{args.ap_aware_prob_weight}/"
+        f"{args.ap_aware_min_multiplier}-{args.ap_aware_max_multiplier}), "
+        f"ap_aware_light=({args.ap_aware_light_score_weight}/{args.ap_aware_light_prob_weight}/"
+        f"{args.ap_aware_light_min_multiplier}-{args.ap_aware_light_max_multiplier}), "
+        f"duplicate_score_weight={args.duplicate_score_weight}, "
         f"background_soft_suppression={not args.disable_background_soft_suppression}, "
         f"background_prob_threshold={args.background_prob_threshold}, "
         f"background_detector_score_threshold={args.background_detector_score_threshold}, "
