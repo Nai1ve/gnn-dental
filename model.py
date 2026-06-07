@@ -905,6 +905,10 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
         )
         self.structural_bias = torch.nn.Linear(geom_dim, self.background_idx, bias=False)
         torch.nn.init.zeros_(self.structural_bias.weight)
+        self.detector_prior_smoothing = 0.18
+        self.detector_logit_temperature = 2.0
+        self.struct_prior_scale = 0.55
+        self.register_buffer("slot_fusion_floor", torch.tensor([[0.25, 0.15, 0.15]], dtype=torch.float))
         self.slot_fusion_gate = torch.nn.Sequential(
             torch.nn.Linear(self.fused_dim + self.background_idx + self.background_idx, 128),
             torch.nn.ReLU(),
@@ -981,9 +985,26 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
         original_prior = data.x_prior.to(device)
         if not self.use_prior:
             original_prior = torch.zeros_like(original_prior)
-        detector_slot_logits = torch.log(original_prior[:, :self.background_idx].clamp_min(1e-6))
-        slot_prior = getattr(data, "x_slot_prior", torch.zeros_like(detector_slot_logits)).to(device)
+        detector_slot_probs = original_prior[:, :self.background_idx].clamp_min(0.0)
+        uniform_slot_probs = torch.full_like(detector_slot_probs, 1.0 / self.background_idx)
+        tooth_mass = detector_slot_probs.sum(dim=1, keepdim=True)
+        normalized_detector_probs = torch.where(
+            tooth_mass > 1e-6,
+            detector_slot_probs / tooth_mass.clamp_min(1e-6),
+            uniform_slot_probs,
+        )
+        smoothed_detector_probs = (
+            (1.0 - self.detector_prior_smoothing) * normalized_detector_probs
+            + self.detector_prior_smoothing * uniform_slot_probs
+        )
+        slot_prior = getattr(data, "x_slot_prior", torch.zeros_like(detector_slot_probs)).to(device)
         raw_scores = ((original_prior[:, -1:] + 1.0) / 2.0).clamp(0.0, 1.0)
+        detector_conf_scale = 0.75 + 0.25 * raw_scores
+        detector_slot_logits = (
+            torch.log(smoothed_detector_probs.clamp_min(1e-6))
+            / self.detector_logit_temperature
+            * detector_conf_scale
+        )
         raw_labels = torch.argmax(original_prior[:, :self.background_idx], dim=1)
         raw_slot_prior = slot_prior.gather(1, raw_labels.unsqueeze(1))
         raw_struct_ok = (raw_slot_prior > 0.25).float()
@@ -1015,9 +1036,11 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             h_2 = self.norm_2(h_2)
 
             relational_logits = self.slot_head(h_2)
-            struct_logits = slot_prior + structural_slot_bias
+            struct_logits = self.struct_prior_scale * slot_prior + structural_slot_bias
             fusion_input = torch.cat([h_2, detector_slot_logits, slot_prior], dim=1)
-            fusion_weights = F.softmax(self.slot_fusion_gate(fusion_input), dim=1)
+            raw_fusion_weights = F.softmax(self.slot_fusion_gate(fusion_input), dim=1)
+            fusion_floor = self.slot_fusion_floor.to(device)
+            fusion_weights = fusion_floor + (1.0 - fusion_floor.sum(dim=1, keepdim=True)) * raw_fusion_weights
             slot_logits = (
                 fusion_weights[:, 0:1] * relational_logits
                 + fusion_weights[:, 1:2] * detector_slot_logits
@@ -1026,6 +1049,9 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
             quality_logits = self.quality_head(h_2)
             all_step_outputs.append({
                 "slot_logits": slot_logits,
+                "relational_logits": relational_logits,
+                "detector_slot_logits": detector_slot_logits,
+                "struct_logits": struct_logits,
                 "quality_logits": quality_logits,
                 "fusion_weights": fusion_weights,
             })
@@ -1039,7 +1065,7 @@ class SlotQualityRecurrentAnatomyGAT(torch.nn.Module):
                 gate_features = torch.cat([h_2, raw_scores, raw_struct_ok, confidence], dim=1)
                 base_gate = torch.sigmoid(self.belief_gate(gate_features))
                 protect = (raw_scores * raw_struct_ok).clamp(0.0, 1.0)
-                update_gate = (0.70 - 0.45 * protect) * base_gate
+                update_gate = (0.85 - 0.55 * protect) * base_gate
                 current_dynamic_belief = (1.0 - update_gate) * original_prior + update_gate * candidate_belief
 
         if return_att:

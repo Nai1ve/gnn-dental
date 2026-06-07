@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--save-dir", default=os.environ.get("GNN_SAVE_DIR", DEFAULT_SAVE_DIR))
     parser.add_argument("--epochs", type=int, default=160)
     parser.add_argument("--batch-size", type=int, default=6)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--patience", type=int, default=24)
     parser.add_argument("--num-iterations", type=int, default=5)
@@ -158,10 +158,25 @@ class SlotQualityCriterion(torch.nn.Module):
         raw_wrong = slot_valid & (raw_labels != safe_slot_target)
         high_score_correct = raw_correct & (detector_scores >= 0.80)
         slot_weights = torch.zeros_like(slot_ce_all)
-        slot_weights[raw_correct] = 1.2
-        slot_weights[high_score_correct] = 1.8
-        slot_weights[raw_wrong] = 2.8
+        slot_weights[raw_correct] = 1.0
+        slot_weights[high_score_correct] = 1.4
+        slot_weights[raw_wrong] = 4.5
         slot_loss = weighted_mean(slot_ce_all, slot_weights) if slot_valid.any() else slot_ce_all.sum() * 0.0
+
+        relational_logits = step_output.get("relational_logits")
+        if relational_logits is None:
+            relational_loss = slot_logits.sum() * 0.0
+        else:
+            relational_ce = F.cross_entropy(relational_logits, safe_slot_target, reduction="none")
+            relational_weights = torch.zeros_like(relational_ce)
+            relational_weights[raw_correct] = 0.7
+            relational_weights[high_score_correct] = 0.9
+            relational_weights[raw_wrong] = 5.0
+            relational_loss = (
+                weighted_mean(relational_ce, relational_weights)
+                if slot_valid.any()
+                else relational_ce.sum() * 0.0
+            )
 
         quality_ce = F.cross_entropy(quality_logits, quality_target.clamp(0, 1), reduction="none")
         quality_weights = torch.full_like(quality_ce, 0.35)
@@ -226,7 +241,7 @@ class SlotQualityCriterion(torch.nn.Module):
                 competitor_prior[:, 0],
             )
             slot_prior_margin = weighted_mean(
-                F.relu(0.20 - target_prior + best_other_prior),
+                F.relu(0.15 - target_prior + best_other_prior),
                 slot_valid.float(),
             )
             raw_struct_score = raw_prior
@@ -274,19 +289,21 @@ class SlotQualityCriterion(torch.nn.Module):
 
         total = (
             slot_loss
+            + 0.35 * relational_loss
             + 0.55 * quality_loss
             + 0.10 * keep_margin
-            + 0.15 * correction_margin
+            + 0.30 * correction_margin
             + 0.08 * cross_dentition_penalty
             + 0.05 * cross_dentition_correction_margin
             + 0.05 * quality_margin
             + 0.08 * background_confidence_loss
-            + 0.05 * slot_prior_margin
+            + 0.03 * slot_prior_margin
             + 0.06 * pairwise_order_loss
             + 0.08 * overcorrection_loss
         )
         parts = {
             "slot": slot_loss.detach(),
+            "relational": relational_loss.detach(),
             "quality": quality_loss.detach(),
             "keep_margin": keep_margin.detach(),
             "correction_margin": correction_margin.detach(),
@@ -301,7 +318,7 @@ class SlotQualityCriterion(torch.nn.Module):
         return total, parts
 
 
-def conservative_relabel_for_validation(class_logits, raw_labels, quality_logits=None, slot_prior=None, detector_scores=None, margin=0.06, min_prob=0.20):
+def conservative_relabel_for_validation(class_logits, raw_labels, quality_logits=None, slot_prior=None, detector_scores=None, margin=0.035, min_prob=0.15):
     probs = F.softmax(class_logits, dim=1)
     raw_labels = raw_labels.clamp(0, BACKGROUND_IDX)
     best_tooth_probs, best_tooth_labels = probs[:, :BACKGROUND_IDX].max(dim=1)
@@ -309,13 +326,13 @@ def conservative_relabel_for_validation(class_logits, raw_labels, quality_logits
     keep_ok = torch.ones_like(best_tooth_probs, dtype=torch.bool)
     if quality_logits is not None:
         quality_probs = F.softmax(quality_logits, dim=1)
-        keep_ok = quality_probs[:, 1] >= 0.50
+        keep_ok = quality_probs[:, 1] >= 0.45
     structure_ok = torch.ones_like(best_tooth_probs, dtype=torch.bool)
     if slot_prior is not None:
         slot_prior = slot_prior.to(class_logits.device)
         new_prior = slot_prior.gather(1, best_tooth_labels.unsqueeze(1)).squeeze(1)
         raw_prior = slot_prior.gather(1, raw_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
-        structure_ok = (new_prior >= raw_prior) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
+        structure_ok = (new_prior + 0.12 >= raw_prior) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
     if detector_scores is not None:
         high_score_struct_ok = (detector_scores >= 0.75) & structure_ok
         strict_high = detector_scores >= 0.85
@@ -337,6 +354,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     part_keys = [
         "slot",
+        "relational",
         "quality",
         "keep_margin",
         "correction_margin",
@@ -400,6 +418,8 @@ def validate_epoch(model, loader, criterion, device):
     top_fixes_total = 0
     top_breaks_total = 0
     wrong_to_wrong_total = 0
+    fusion_sum = torch.zeros(3, dtype=torch.float, device=device)
+    fusion_count = 0
 
     for batch in loader:
         batch = batch.to(device)
@@ -410,6 +430,9 @@ def validate_epoch(model, loader, criterion, device):
 
         _, _, class_logits = step_to_logits(step_output)
         _, quality_logits, _ = step_to_logits(step_output)
+        if "fusion_weights" in step_output:
+            fusion_sum += step_output["fusion_weights"].detach().sum(dim=0)
+            fusion_count += int(step_output["fusion_weights"].size(0))
         raw_labels = get_raw_labels(batch).to(device)
         detector_scores = get_detector_scores(batch).to(device)
         slot_prior = getattr(batch, "x_slot_prior", None)
@@ -477,6 +500,9 @@ def validate_epoch(model, loader, criterion, device):
         "cross_dentition_bad_change_total": cross_dentition_bad_change,
         "fp_h_keep_total": fp_h_keep,
         "fp_h_total": fp_h_total,
+        "fusion_rel": float((fusion_sum[0] / fusion_count).detach().cpu()) if fusion_count else 0.0,
+        "fusion_det": float((fusion_sum[1] / fusion_count).detach().cpu()) if fusion_count else 0.0,
+        "fusion_struct": float((fusion_sum[2] / fusion_count).detach().cpu()) if fusion_count else 0.0,
     }
     return (
         total_loss / len(loader.dataset),
@@ -586,7 +612,8 @@ def main():
         logging.info(
             f"Epoch {epoch:03d} | lr={optimizer.param_groups[0]['lr']:.1e} | "
             f"train_loss={train_metrics['loss']:.4f} "
-            f"(slot={train_metrics['slot']:.4f}, quality={train_metrics['quality']:.4f}, "
+            f"(slot={train_metrics['slot']:.4f}, rel={train_metrics['relational']:.4f}, "
+            f"quality={train_metrics['quality']:.4f}, "
             f"cross={train_metrics['cross_dentition']:.4f}, bg={train_metrics['background_confidence']:.4f}, "
             f"order={train_metrics['pairwise_order']:.4f}, over={train_metrics['overcorrection']:.4f}) | "
             f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, conf_acc={val_conf_acc:.4f}, "
@@ -597,7 +624,9 @@ def main():
             f"wrong_to_wrong_rate={val_diag['wrong_to_wrong_rate']:.4f}, "
             f"cross_bad_rate={val_diag['cross_dentition_bad_change_rate']:.4f}, "
             f"fp_h_keep_rate={val_diag['fp_h_keep_rate']:.4f}, "
-            f"pred_bg_tooth_rate={val_diag['pred_bg_for_tooth_rate']:.4f}, score={score:.4f}"
+            f"pred_bg_tooth_rate={val_diag['pred_bg_for_tooth_rate']:.4f}, "
+            f"fusion=({val_diag['fusion_rel']:.2f}/{val_diag['fusion_det']:.2f}/{val_diag['fusion_struct']:.2f}), "
+            f"score={score:.4f}"
         )
 
         bad_change_ok = val_diag["bad_change_rate"] <= 0.015

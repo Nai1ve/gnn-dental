@@ -52,8 +52,8 @@ def parse_args():
     parser.add_argument("--num-iterations", type=int, default=5)
     parser.add_argument("--geom-dim", type=int, default=37)
     parser.add_argument("--edge-attr-dim", type=int, default=22)
-    parser.add_argument("--relabel-margin", type=float, default=0.06)
-    parser.add_argument("--relabel-min-prob", type=float, default=0.20)
+    parser.add_argument("--relabel-margin", type=float, default=0.035)
+    parser.add_argument("--relabel-min-prob", type=float, default=0.15)
     parser.add_argument("--duplicate-iou-threshold", type=float, default=0.50)
     parser.add_argument("--duplicate-ios-threshold", type=float, default=0.75)
     parser.add_argument(
@@ -231,7 +231,7 @@ def conservative_relabel(
         slot_prior = slot_prior.to(class_logits.device)
         raw_struct = slot_prior.gather(1, raw_labels.clamp(0, BACKGROUND_IDX - 1).unsqueeze(1)).squeeze(1)
         new_struct = slot_prior.gather(1, best_tooth_labels.unsqueeze(1)).squeeze(1)
-        structure_ok = (new_struct >= raw_struct) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
+        structure_ok = (new_struct + 0.12 >= raw_struct) | adjacent_or_same_structure(raw_labels, best_tooth_labels)
     adjacent_ok = adjacent_or_same_structure(raw_labels, best_tooth_labels)
     high_score_protect = (detector_scores >= 0.75) & (raw_struct >= 0.25)
     strict_high_protect = detector_scores >= float(high_score_adjacent_threshold)
@@ -240,7 +240,7 @@ def conservative_relabel(
         (best_tooth_labels != raw_labels)
         & (best_tooth_probs >= relabel_min_prob)
         & ((best_tooth_probs - raw_probs) >= relabel_margin)
-        & (keep_probs >= 0.50)
+        & (keep_probs >= 0.45)
         & structure_ok
         & (~high_score_protect | adjacent_ok)
         & (~strict_high_protect | adjacent_ok)
