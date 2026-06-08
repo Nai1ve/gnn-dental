@@ -15,7 +15,7 @@ BACKGROUND_IDX = 48
 NUM_RELATIONS = 5
 DEFAULT_TRAIN_DATA = "gnn_data/train_sin_arch4_edge_01_slot_struct_order.pt"
 DEFAULT_VAL_DATA = "gnn_data/val_sin_arch4_edge_01_slot_struct_order.pt"
-DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_APAware"
+DEFAULT_SAVE_DIR = "checkpoints/SlotQuality_StructOrder_NoVisual_T5_APRankHard"
 
 CLASS_NAMES = [
     "11", "12", "13", "14", "15", "16", "17",
@@ -151,6 +151,27 @@ def margin_loss(logits, target, competitor, mask, margin):
     return F.relu(margin - target_logit + competitor_logit).mean()
 
 
+def topk_positive_mean(values, max_items=256):
+    flat = values.reshape(-1)
+    flat = flat[flat > 0]
+    if flat.numel() == 0:
+        return values.sum() * 0.0
+    k = min(int(max_items), int(flat.numel()))
+    return flat.topk(k).values.mean()
+
+
+def compute_ap_score_rank(class_logits, score_delta_tanh, detector_scores, slot_target, raw_labels):
+    class_probs = F.softmax(class_logits, dim=1)
+    slot_valid = (slot_target >= 0) & (slot_target < BACKGROUND_IDX)
+    safe_slot = slot_target.clamp(0, BACKGROUND_IDX - 1)
+    rank_labels = torch.where(slot_valid, safe_slot, raw_labels.clamp(0, BACKGROUND_IDX - 1))
+    label_probs = class_probs.gather(1, rank_labels.unsqueeze(1)).squeeze(1)
+    bg_probs = class_probs[:, BACKGROUND_IDX]
+    prob_delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
+    multiplier = (1.0 + 0.18 * score_delta_tanh + 0.04 * prob_delta).clamp(0.72, 1.12)
+    return (detector_scores * multiplier).clamp(0, 1)
+
+
 def score_ranking_loss(score_rank, slot_target, quality_target, node_role, batch_index, margin_slot=0.06, margin_fp_h=0.10):
     losses = []
     valid_slot = (slot_target >= 0) & (slot_target < BACKGROUND_IDX)
@@ -187,6 +208,62 @@ def score_ranking_loss(score_rank, slot_target, quality_target, node_role, batch
     return torch.stack(losses).mean()
 
 
+def hard_ap_ranking_loss(
+    score_rank,
+    slot_target,
+    quality_target,
+    node_role,
+    detector_scores,
+    best_gt_iou,
+    batch_index,
+    margin_duplicate=0.10,
+    margin_fp_h=0.20,
+    margin_other_fp=0.12,
+):
+    losses = []
+    valid_slot = (slot_target >= 0) & (slot_target < BACKGROUND_IDX)
+    safe_slot = slot_target.clamp(0, BACKGROUND_IDX - 1)
+    for graph_id in torch.unique(batch_index):
+        graph_mask = batch_index == graph_id
+        active = graph_mask & valid_slot & (quality_target == 1)
+        if not active.any():
+            continue
+
+        for cls_idx in torch.unique(safe_slot[active]):
+            pos = active & (safe_slot == cls_idx)
+            neg = graph_mask & (quality_target == 0) & (node_role == 1) & (safe_slot == cls_idx)
+            if pos.any() and neg.any():
+                dynamic_margin = (
+                    margin_duplicate
+                    + 0.08 * (detector_scores[neg].view(1, -1) - detector_scores[pos].view(-1, 1)).clamp_min(0)
+                    + 0.03 * (1.0 - best_gt_iou[neg].view(1, -1))
+                )
+                violation = dynamic_margin - score_rank[pos].view(-1, 1) + score_rank[neg].view(1, -1)
+                losses.append(topk_positive_mean(F.relu(violation), max_items=128))
+
+        hard_neg = (
+            graph_mask
+            & (quality_target == 0)
+            & (
+                (node_role == 3)
+                | ((node_role == 1) & (detector_scores >= 0.12))
+                | ((node_role == 2) & (detector_scores >= 0.18))
+            )
+        )
+        if hard_neg.any():
+            neg_margin = torch.full_like(detector_scores[hard_neg], margin_other_fp)
+            neg_margin = torch.where(node_role[hard_neg] == 3, torch.full_like(neg_margin, margin_fp_h), neg_margin)
+            neg_margin = neg_margin + 0.08 * detector_scores[hard_neg] - 0.04 * best_gt_iou[hard_neg]
+            neg_weight = (0.45 + 0.75 * detector_scores[hard_neg]).clamp(0.45, 1.20)
+            neg_weight = torch.where(node_role[hard_neg] == 3, neg_weight * 1.35, neg_weight)
+            violation = neg_margin.view(1, -1) - score_rank[active].view(-1, 1) + score_rank[hard_neg].view(1, -1)
+            losses.append(topk_positive_mean(F.relu(violation) * neg_weight.view(1, -1), max_items=256))
+
+    if not losses:
+        return score_rank.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
 @torch.no_grad()
 def score_rank_counts(score_rank, slot_target, quality_target, node_role, batch_index):
     slot_correct = 0
@@ -215,6 +292,30 @@ def score_rank_counts(score_rank, slot_target, quality_target, node_role, batch_
             fp_h_total += int(comp.numel())
 
     return slot_correct, slot_total, fp_h_correct, fp_h_total
+
+
+@torch.no_grad()
+def hard_rank_counts(score_rank, slot_target, quality_target, node_role, detector_scores, batch_index):
+    correct = 0
+    total = 0
+    valid_slot = (slot_target >= 0) & (slot_target < BACKGROUND_IDX)
+    for graph_id in torch.unique(batch_index):
+        graph_mask = batch_index == graph_id
+        active = graph_mask & valid_slot & (quality_target == 1)
+        hard_neg = (
+            graph_mask
+            & (quality_target == 0)
+            & (
+                (node_role == 3)
+                | ((node_role == 1) & (detector_scores >= 0.12))
+                | ((node_role == 2) & (detector_scores >= 0.18))
+            )
+        )
+        if active.any() and hard_neg.any():
+            comp = score_rank[active].view(-1, 1) > score_rank[hard_neg].view(1, -1)
+            correct += int(comp.sum())
+            total += int(comp.numel())
+    return correct, total
 
 
 class SlotQualityCriterion(torch.nn.Module):
@@ -259,11 +360,16 @@ class SlotQualityCriterion(torch.nn.Module):
             )
 
         quality_ce = F.cross_entropy(quality_logits, quality_target.clamp(0, 1), reduction="none")
-        quality_weights = torch.full_like(quality_ce, 0.35)
-        quality_weights[quality_target == 1] = 1.2
-        quality_weights[node_role == 1] = 1.0
-        quality_weights[node_role == 2] = 0.8
-        quality_weights[node_role == 3] = 0.7
+        quality_weights = torch.full_like(quality_ce, 0.30)
+        quality_weights[quality_target == 1] = 1.10
+        quality_weights[node_role == 1] = 1.30
+        quality_weights[node_role == 2] = 0.75
+        quality_weights[node_role == 3] = 2.20
+        ambiguous_background = (quality_target == 0) & (best_gt_iou >= 0.30)
+        quality_weights[ambiguous_background] = torch.minimum(
+            quality_weights[ambiguous_background],
+            torch.full_like(quality_weights[ambiguous_background], 0.55),
+        )
         quality_loss = weighted_mean(quality_ce, quality_weights)
 
         keep_mask = raw_correct & (quality_target == 1)
@@ -299,9 +405,19 @@ class SlotQualityCriterion(torch.nn.Module):
         tooth_probs = F.softmax(slot_logits, dim=1)
         tooth_max_prob = tooth_probs.max(dim=1).values
         background_mask = quality_target == 0
+        bg_tooth_ceiling = torch.full_like(tooth_max_prob, 0.45)
+        bg_tooth_ceiling[node_role == 1] = 0.35
+        bg_tooth_ceiling[node_role == 3] = 0.25
+        bg_conf_weights = background_mask.float()
+        bg_conf_weights[node_role == 1] = 1.20
+        bg_conf_weights[node_role == 3] = 2.50
+        bg_conf_weights[ambiguous_background] = torch.minimum(
+            bg_conf_weights[ambiguous_background],
+            torch.full_like(bg_conf_weights[ambiguous_background], 0.45),
+        )
         background_confidence_loss = weighted_mean(
-            F.relu(tooth_max_prob - 0.45),
-            background_mask.float(),
+            F.relu(tooth_max_prob - bg_tooth_ceiling),
+            bg_conf_weights,
         )
 
         slot_prior = getattr(batch, "x_slot_prior", None)
@@ -365,10 +481,18 @@ class SlotQualityCriterion(torch.nn.Module):
                 )
 
         keep_vs_drop = F.relu(0.25 - quality_logits[:, 1] + quality_logits[:, 0])
-        drop_vs_keep = F.relu(0.10 - quality_logits[:, 0] + quality_logits[:, 1])
+        drop_margin = torch.full_like(detector_scores, 0.10)
+        drop_margin[node_role == 1] = 0.18
+        drop_margin[node_role == 3] = 0.32
+        drop_margin[ambiguous_background] = 0.06
+        drop_vs_keep = F.relu(drop_margin - quality_logits[:, 0] + quality_logits[:, 1])
+        drop_weights = (quality_target == 0).float()
+        drop_weights[node_role == 1] = 1.25
+        drop_weights[node_role == 3] = 2.20
+        drop_weights[ambiguous_background] = 0.45
         quality_margin = (
             weighted_mean(keep_vs_drop, (quality_target == 1).float())
-            + 0.5 * weighted_mean(drop_vs_keep, (quality_target == 0).float())
+            + 0.5 * weighted_mean(drop_vs_keep, drop_weights)
         )
 
         score_delta = step_output.get("score_delta")
@@ -376,36 +500,44 @@ class SlotQualityCriterion(torch.nn.Module):
             score_delta = slot_logits.sum(dim=1) * 0.0
         score_delta_tanh = torch.tanh(score_delta)
         score_target = torch.zeros_like(score_delta_tanh)
-        score_target[quality_target == 1] = 0.16
-        score_target[raw_correct & (detector_scores >= 0.80)] = 0.04
+        score_target[quality_target == 1] = 0.10
+        score_target[(quality_target == 1) & (detector_scores < 0.35)] = 0.18
+        score_target[raw_correct & (detector_scores >= 0.80)] = 0.02
         score_target[raw_wrong & (quality_target == 1)] = 0.24
-        score_target[(quality_target == 0) & (node_role == 1)] = -0.50
-        score_target[(quality_target == 0) & (node_role == 2)] = -0.34
-        score_target[(quality_target == 0) & (node_role == 3)] = -0.70
-        score_target[(quality_target == 0) & (best_gt_iou >= 0.30)] = -0.24
+        score_target[(quality_target == 0) & (node_role == 1)] = -0.48
+        score_target[(quality_target == 0) & (node_role == 2)] = -0.30
+        score_target[(quality_target == 0) & (node_role == 3)] = -0.88
+        score_target[ambiguous_background] = -0.18
 
         score_weights = torch.full_like(score_delta_tanh, 0.25)
         score_weights[quality_target == 1] = 1.0
+        score_weights[(quality_target == 1) & (detector_scores < 0.35)] = 1.25
         score_weights[raw_wrong & (quality_target == 1)] = 1.4
-        score_weights[(quality_target == 0) & (node_role == 1)] = 1.5
+        score_weights[(quality_target == 0) & (node_role == 1)] = 1.8
         score_weights[(quality_target == 0) & (node_role == 2)] = 0.8
-        score_weights[(quality_target == 0) & (node_role == 3)] = 1.8
+        score_weights[(quality_target == 0) & (node_role == 3)] = 3.0
+        score_weights[ambiguous_background] = 0.55
         score_regression = weighted_mean(
             F.smooth_l1_loss(score_delta_tanh, score_target, reduction="none"),
             score_weights,
         )
-        score_rank = (
-            detector_scores
-            + 0.30 * score_delta_tanh
-            + 0.08 * torch.tanh(quality_logits[:, 1] - quality_logits[:, 0])
-        )
+        score_rank = compute_ap_score_rank(class_logits, score_delta_tanh, detector_scores, slot_target, raw_labels)
         if hasattr(batch, "batch"):
             batch_index = batch.batch.to(slot_logits.device)
         else:
             batch_index = torch.zeros_like(score_delta_tanh, dtype=torch.long)
         ap_rank_loss = score_ranking_loss(score_rank, slot_target, quality_target, node_role, batch_index)
+        hard_ap_rank_loss = hard_ap_ranking_loss(
+            score_rank,
+            slot_target,
+            quality_target,
+            node_role,
+            detector_scores,
+            best_gt_iou,
+            batch_index,
+        )
         keep_score_floor = weighted_mean(
-            F.relu(0.20 - (detector_scores * (1.0 + 0.30 * score_delta_tanh))),
+            F.relu(0.20 - score_rank),
             ((quality_target == 1) & (detector_scores >= 0.20)).float(),
         )
 
@@ -418,13 +550,14 @@ class SlotQualityCriterion(torch.nn.Module):
             + 0.08 * cross_dentition_penalty
             + 0.05 * cross_dentition_correction_margin
             + 0.05 * quality_margin
-            + 0.12 * background_confidence_loss
+            + 0.16 * background_confidence_loss
             + 0.06 * slot_prior_margin
             + 0.06 * pairwise_order_loss
             + 0.08 * overcorrection_loss
-            + 0.16 * score_regression
-            + 0.18 * ap_rank_loss
-            + 0.06 * keep_score_floor
+            + 0.20 * score_regression
+            + 0.14 * ap_rank_loss
+            + 0.28 * hard_ap_rank_loss
+            + 0.08 * keep_score_floor
         )
         parts = {
             "slot": slot_loss.detach(),
@@ -441,6 +574,7 @@ class SlotQualityCriterion(torch.nn.Module):
             "overcorrection": overcorrection_loss.detach(),
             "score_regression": score_regression.detach(),
             "ap_rank": ap_rank_loss.detach(),
+            "hard_ap_rank": hard_ap_rank_loss.detach(),
             "keep_score_floor": keep_score_floor.detach(),
         }
         return total, parts
@@ -495,6 +629,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
         "overcorrection",
         "score_regression",
         "ap_rank",
+        "hard_ap_rank",
         "keep_score_floor",
     ]
     totals = {"loss": 0.0, **{key: 0.0 for key in part_keys}}
@@ -553,6 +688,8 @@ def validate_epoch(model, loader, criterion, device):
     slot_rank_total = 0
     fp_h_rank_correct = 0
     fp_h_rank_total = 0
+    hard_rank_correct = 0
+    hard_rank_total = 0
     fusion_sum = torch.zeros(3, dtype=torch.float, device=device)
     fusion_count = 0
 
@@ -579,13 +716,17 @@ def validate_epoch(model, loader, criterion, device):
         tooth_mask = y_true != BACKGROUND_IDX
         score_delta = step_output.get("score_delta")
         if score_delta is not None:
-            score_rank = detector_scores + 0.30 * torch.tanh(score_delta)
+            score_delta_tanh = torch.tanh(score_delta)
+            score_rank = compute_ap_score_rank(class_logits, score_delta_tanh, detector_scores, slot_target, raw_labels)
             batch_index = batch.batch.to(device) if hasattr(batch, "batch") else torch.zeros_like(y_true)
             sc, st, fc, ft = score_rank_counts(score_rank, slot_target, quality_target, node_role, batch_index)
             slot_rank_correct += sc
             slot_rank_total += st
             fp_h_rank_correct += fc
             fp_h_rank_total += ft
+            hc, ht = hard_rank_counts(score_rank, slot_target, quality_target, node_role, detector_scores, batch_index)
+            hard_rank_correct += hc
+            hard_rank_total += ht
 
         correct_total += int((pred == y_true).sum())
         total_nodes += batch.num_nodes
@@ -643,8 +784,10 @@ def validate_epoch(model, loader, criterion, device):
         "wrong_to_wrong_rate": wrong_to_wrong_total / raw_wrong_tooth if raw_wrong_tooth else 0.0,
         "slot_rank_auc_proxy": slot_rank_correct / slot_rank_total if slot_rank_total else 1.0,
         "fp_h_rank_auc_proxy": fp_h_rank_correct / fp_h_rank_total if fp_h_rank_total else 1.0,
+        "hard_rank_auc_proxy": hard_rank_correct / hard_rank_total if hard_rank_total else 1.0,
         "slot_rank_pairs": slot_rank_total,
         "fp_h_rank_pairs": fp_h_rank_total,
+        "hard_rank_pairs": hard_rank_total,
         "cross_dentition_bad_change_total": cross_dentition_bad_change,
         "fp_h_keep_total": fp_h_keep,
         "fp_h_total": fp_h_total,
@@ -750,11 +893,12 @@ def main():
             + 0.55 * val_diag["top_fix_rate"]
             + 0.45 * val_diag["slot_rank_auc_proxy"]
             + 0.35 * val_diag["fp_h_rank_auc_proxy"]
+            + 0.55 * val_diag["hard_rank_auc_proxy"]
             - 1.80 * val_diag["bad_change_rate"]
             - 0.65 * val_diag["top_break_rate"]
             - 0.45 * val_diag["wrong_to_wrong_rate"]
             - 0.75 * val_diag["cross_dentition_bad_change_rate"]
-            - 0.30 * val_diag["fp_h_keep_rate"]
+            - 0.55 * val_diag["fp_h_keep_rate"]
             - 0.35 * val_diag["pred_bg_for_tooth_rate"]
             - 0.05 * val_loss
         )
@@ -773,6 +917,7 @@ def main():
             f"cross={train_metrics['cross_dentition']:.4f}, bg={train_metrics['background_confidence']:.4f}, "
             f"order={train_metrics['pairwise_order']:.4f}, over={train_metrics['overcorrection']:.4f}, "
             f"score_reg={train_metrics['score_regression']:.4f}, ap_rank={train_metrics['ap_rank']:.4f}, "
+            f"hard_rank={train_metrics['hard_ap_rank']:.4f}, "
             f"score_floor={train_metrics['keep_score_floor']:.4f}) | "
             f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}, conf_acc={val_conf_acc:.4f}, "
             f"correction_rate={val_diag['correction_rate']:.4f}, "
@@ -782,6 +927,7 @@ def main():
             f"wrong_to_wrong_rate={val_diag['wrong_to_wrong_rate']:.4f}, "
             f"slot_rank={val_diag['slot_rank_auc_proxy']:.4f}, "
             f"fp_h_rank={val_diag['fp_h_rank_auc_proxy']:.4f}, "
+            f"hard_rank={val_diag['hard_rank_auc_proxy']:.4f}, "
             f"cross_bad_rate={val_diag['cross_dentition_bad_change_rate']:.4f}, "
             f"fp_h_keep_rate={val_diag['fp_h_keep_rate']:.4f}, "
             f"pred_bg_tooth_rate={val_diag['pred_bg_for_tooth_rate']:.4f}, "
