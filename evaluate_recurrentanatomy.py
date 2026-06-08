@@ -61,12 +61,13 @@ def parse_args():
     parser.add_argument("--duplicate-ios-threshold", type=float, default=0.70)
     parser.add_argument(
         "--score-calibration",
-        choices=("raw", "gnn_delta", "ap_aware", "ap_aware_light"),
-        default="ap_aware_light",
+        choices=("raw", "gnn_delta", "ap_aware", "ap_aware_light", "ap_aware_domain"),
+        default="ap_aware_domain",
         help=(
             "raw keeps detector scores except soft suppression; gnn_delta applies the older light GNN probability multiplier; "
             "ap_aware uses the learned score_delta head for COCO ranking calibration; "
-            "ap_aware_light uses a smaller learned calibration to preserve detector AP."
+            "ap_aware_light uses a smaller learned calibration to preserve detector AP; "
+            "ap_aware_domain applies full calibration only when the graph shows external-domain score-shift evidence."
         ),
     )
     parser.add_argument("--ap-aware-score-weight", type=float, default=0.18)
@@ -77,6 +78,11 @@ def parse_args():
     parser.add_argument("--ap-aware-light-prob-weight", type=float, default=0.02)
     parser.add_argument("--ap-aware-light-min-multiplier", type=float, default=0.90)
     parser.add_argument("--ap-aware-light-max-multiplier", type=float, default=1.06)
+    parser.add_argument("--ap-aware-domain-mean-threshold", type=float, default=-0.025)
+    parser.add_argument("--ap-aware-domain-low-delta-threshold", type=float, default=-0.08)
+    parser.add_argument("--ap-aware-domain-low-frac-threshold", type=float, default=0.28)
+    parser.add_argument("--ap-aware-gate-delta-threshold", type=float, default=0.06)
+    parser.add_argument("--ap-aware-gate-raw-score-threshold", type=float, default=0.80)
     parser.add_argument("--duplicate-score-weight", type=float, default=0.18)
     parser.add_argument(
         "--duplicate-action",
@@ -381,6 +387,11 @@ def calibrate_scores(
     ap_light_prob_weight=0.02,
     ap_light_min_multiplier=0.90,
     ap_light_max_multiplier=1.06,
+    domain_mean_threshold=-0.025,
+    domain_low_delta_threshold=-0.08,
+    domain_low_frac_threshold=0.28,
+    gate_delta_threshold=0.06,
+    gate_raw_score_threshold=0.80,
 ):
     safe_labels = final_labels.clamp(0, BACKGROUND_IDX)
     label_probs = class_probs.gather(1, safe_labels.unsqueeze(1)).squeeze(1)
@@ -403,6 +414,34 @@ def calibrate_scores(
             + float(ap_light_score_weight) * learned_delta
             + float(ap_light_prob_weight) * prob_delta
         ).clamp(float(ap_light_min_multiplier), float(ap_light_max_multiplier))
+        calibrated = (detector_scores * multiplier).clamp(0, 1)
+    elif score_calibration == "ap_aware_domain" and score_delta is not None:
+        learned_delta = torch.tanh(score_delta).clamp(-1.0, 1.0)
+        prob_delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
+        low_delta_frac = (learned_delta <= float(domain_low_delta_threshold)).float().mean()
+        domain_shifted = (
+            learned_delta.mean() <= float(domain_mean_threshold)
+            or low_delta_frac >= float(domain_low_frac_threshold)
+        )
+        if bool(domain_shifted):
+            multiplier = (
+                1.0
+                + float(ap_score_weight) * learned_delta
+                + float(ap_prob_weight) * prob_delta
+            ).clamp(float(ap_min_multiplier), float(ap_max_multiplier))
+        else:
+            raw_multiplier = (
+                1.0
+                + float(ap_light_score_weight) * learned_delta
+                + float(ap_light_prob_weight) * prob_delta
+            ).clamp(float(ap_light_min_multiplier), float(ap_light_max_multiplier))
+            evidence_mask = (
+                (learned_delta.abs() >= float(gate_delta_threshold))
+                | (detector_scores <= float(gate_raw_score_threshold))
+                | (bg_probs >= float(background_prob_threshold))
+            )
+            multiplier = torch.ones_like(raw_multiplier)
+            multiplier[evidence_mask] = raw_multiplier[evidence_mask]
         calibrated = (detector_scores * multiplier).clamp(0, 1)
     elif score_calibration == "gnn_delta":
         delta = (label_probs - bg_probs).clamp(-1.0, 1.0)
@@ -499,6 +538,11 @@ def postprocess_graph(step_output, graph, args):
         args.ap_aware_light_prob_weight,
         args.ap_aware_light_min_multiplier,
         args.ap_aware_light_max_multiplier,
+        args.ap_aware_domain_mean_threshold,
+        args.ap_aware_domain_low_delta_threshold,
+        args.ap_aware_domain_low_frac_threshold,
+        args.ap_aware_gate_delta_threshold,
+        args.ap_aware_gate_raw_score_threshold,
     )
     return {
         "pred_original": raw_labels.detach().cpu(),
@@ -673,6 +717,11 @@ def main():
         f"{args.ap_aware_min_multiplier}-{args.ap_aware_max_multiplier}), "
         f"ap_aware_light=({args.ap_aware_light_score_weight}/{args.ap_aware_light_prob_weight}/"
         f"{args.ap_aware_light_min_multiplier}-{args.ap_aware_light_max_multiplier}), "
+        f"ap_aware_domain=(mean<={args.ap_aware_domain_mean_threshold}, "
+        f"low_delta<={args.ap_aware_domain_low_delta_threshold}, "
+        f"low_frac>={args.ap_aware_domain_low_frac_threshold}, "
+        f"gate_delta>={args.ap_aware_gate_delta_threshold}, "
+        f"gate_raw<={args.ap_aware_gate_raw_score_threshold}), "
         f"duplicate_score_weight={args.duplicate_score_weight}, "
         f"background_soft_suppression={not args.disable_background_soft_suppression}, "
         f"background_prob_threshold={args.background_prob_threshold}, "
